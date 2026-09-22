@@ -38,18 +38,7 @@
   $effect(() => { app.loadNetwork(); });
 </script>
 
-<ScopeBar crumbs={[["Trips & vehicles", router.href("trips")], ...(v?.trip.block_id ? [["Block " + v.trip.block_id, null] as [string, null]] : []), ["Trip " + tripId, null]]} show={[]}>
-  {#snippet extra()}
-    {#if v}
-      <label class="dt"><span class="lab">Date</span>
-        <select aria-label="Service date" value={v.trip.date} disabled={v.days.length < 2}
-          onchange={(e) => router.set({ date: (e.currentTarget as HTMLSelectElement).value })}>
-          {#each v.days.includes(v.trip.date) ? v.days : [...v.days, v.trip.date] as d}<option value={d}>{dateLabel(d)}</option>{/each}
-        </select>
-      </label>
-    {/if}
-  {/snippet}
-</ScopeBar>
+<ScopeBar crumbs={[["Trips & vehicles", router.href("trips")], ...(v?.trip.block_id ? [["Block " + v.trip.block_id, null] as [string, null]] : []), ["Trip " + tripId, null]]} show={v ? ["date"] : []} dateDays={v?.days ?? []} />
 {#if !v}
   <Loading error={res.error} />
 {:else}
@@ -117,8 +106,6 @@
 {/if}
 
 <style>
-  .dt { display: flex; align-items: center; gap: 4px; }
-  .lab { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; font-stretch: 90%; margin-right: 3px; }
   .dim { opacity: .6; transition: opacity .15s; }
   .hs { font-size: 20px; color: var(--muted); font-weight: 450; margin-left: 8px; }
   .nm { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }

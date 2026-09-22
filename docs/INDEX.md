@@ -31,3 +31,4 @@
 - [2026-09-22-1100-station-search](changelog/2026-09-22-1100-station-search.md) — word-based station search
 - [2026-09-22-1130-mobile-pass](changelog/2026-09-22-1130-mobile-pass.md) — phone-width fixes
 - [2026-09-22-1145-watch-build](changelog/2026-09-22-1145-watch-build.md) — 2.0.0, frontend rebuilds on change
+- [2026-09-22-1605-calendar-everywhere](changelog/2026-09-22-1605-calendar-everywhere.md) — one calendar for every date filter

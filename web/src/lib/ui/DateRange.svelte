@@ -4,10 +4,13 @@
   import { untrack } from "svelte";
   import type { DayInfo } from "../api";
 
-  let { from, to, days, single = false, onchange }: {
-    from: string | null; to: string | null; days: DayInfo[]; single?: boolean;
+  let { from = null, to, days, single = false, onchange }: {
+    from?: string | null; to: string | null; days: (DayInfo | string)[]; single?: boolean;
     onchange: (from: string | null, to: string | null) => void;
   } = $props();
+
+  // a plain list of dates (one entity's service days) counts as one observation each
+  const list = $derived(days.map((d) => (typeof d === "string" ? { date: d, n: 1 } : d)));
 
   const iso = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   const parse = (s: string) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
@@ -15,10 +18,9 @@
   const fmt = (s: string, withYear = false) =>
     parse(s).toLocaleDateString("en-GB", { day: "numeric", month: "short", ...(withYear ? { year: "numeric" } : {}) });
 
-  const first = $derived(days[0]?.date ?? null);
-  const last = $derived(days.at(-1)?.date ?? null);
-  const byDate = $derived(new Map(days.map((d) => [d.date, d.n])));
-  const maxN = $derived(Math.max(1, ...days.map((d) => d.n)));
+  const first = $derived(list[0]?.date ?? null);
+  const last = $derived(list.at(-1)?.date ?? null);
+  const byDate = $derived(new Map(list.map((d) => [d.date, d.n])));
   // effective range (null = the whole span)
   const a = $derived(single ? (to ?? last) : (from ?? first));
   const b = $derived(to ?? last);
@@ -32,6 +34,7 @@
   });
 
   let open = $state(false);
+  let flip = $state(false);                    // triggers near the right edge open leftwards
   let pick = $state<string | null>(null);      // first click of a range
   let hover = $state<string | null>(null);
   let month = $state<Date>(new Date());
@@ -41,7 +44,7 @@
     if (!open) return;
     const m = parse(untrack(() => b) ?? iso(new Date()));
     m.setDate(1);
-    untrack(() => { pick = null; month = m; });
+    untrack(() => { pick = null; month = m; flip = root.getBoundingClientRect().left > innerWidth / 2; });
   });
 
   $effect(() => {
@@ -94,7 +97,7 @@
     {label}{#if !single && nDays > 1}<span class="nd">{isAll ? "all · " : ""}{nDays} days</span>{:else if isAll}<span class="nd">all data</span>{/if}
   </button>
   {#if open}
-    <div class="pop" role="dialog" aria-label="Choose dates">
+    <div class="pop" class:flip role="dialog" aria-label="Choose dates">
       {#if !single}
         <div class="presets">
           {#each PRESETS as [lab, n]}
@@ -116,12 +119,11 @@
               {#each m.cells as d}
                 {#if d}
                   {@const n = byDate.get(d) ?? 0}
-                  {@const inR = lo && hi && d >= lo && d <= hi}
-                  <button class="day" class:has={n > 0} class:in={inR} class:end={d === lo || d === hi} class:today={d === iso(new Date())}
-                    onmouseenter={() => (hover = d)} onclick={() => click(d)}
+                  {@const inR = !single && lo && hi && d >= lo && d <= hi}
+                  <button class="day" class:has={n > 0} class:in={inR} class:end={d === lo || d === hi} class:s={d === lo} class:e={d === hi} class:today={d === iso(new Date())}
+                    disabled={single && !n} onmouseenter={() => (hover = d)} onclick={() => click(d)}
                     aria-label="{fmt(d, true)}{n ? `, ${n.toLocaleString()} observed visits` : ', no data'}" title={n ? `${n.toLocaleString()} visits` : "no data"}>
-                    {parse(d).getDate()}
-                    {#if n > 0}<span class="dot" style:opacity={0.35 + 0.65 * Math.sqrt(n / maxN)}></span>{/if}
+                    <span class="n">{parse(d).getDate()}</span>
                   </button>
                 {:else}<span></span>{/if}
               {/each}
@@ -130,7 +132,7 @@
         {/each}
       </div>
       <div class="foot muted">
-        {#if first && last}History {fmt(first)} – {fmt(last, true)} · <span class="dot inline"></span> days with data{/if}
+        {#if first && last}History {fmt(first)} – {fmt(last, true)}{/if}
       </div>
     </div>
   {/if}
@@ -141,8 +143,9 @@
   .trigger { gap: 6px; }
   .trigger.on { border-color: var(--ink); color: var(--ink); font-weight: 600; }
   .nd { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-left: 2px; }
-  .pop { position: absolute; left: 0; top: calc(100% + 6px); z-index: 40; background: var(--panel); border: 1px solid var(--border);
+  .pop { position: absolute; left: 0; max-width: calc(100vw - 24px); top: calc(100% + 6px); z-index: 40; background: var(--panel); border: 1px solid var(--border);
     border-radius: 6px; box-shadow: var(--shadow-pop); padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .pop.flip { left: auto; right: 0; }
   .presets { display: flex; gap: 6px; flex-wrap: wrap; }
   .nav { display: flex; align-items: center; gap: 8px; }
   .hint { flex: 1; text-align: center; font-size: 11.5px; }
@@ -154,13 +157,20 @@
   .day { position: relative; height: 30px; border: 0; background: none; color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums;
     padding: 0; border-radius: 0; }
   .day.has { color: var(--ink); font-weight: 550; }
-  .day:hover { background: var(--sunk); }
+  .day:disabled { cursor: default; }
+  /* the range is one bar between the ends' circles: the end cells carry only their inner half of it */
   .day.in { background: var(--sunk); }
-  .day.end { background: var(--ink); color: var(--panel); border-radius: 3px; }
-  .day.today::after { content: ""; position: absolute; left: 9px; right: 9px; bottom: 3px; height: 1.5px; background: var(--focus); }
-  .dot { position: absolute; top: 3px; right: 5px; width: 5px; height: 5px; border-radius: 50%; background: var(--ok); }
-  .day.end .dot { background: var(--panel); }
-  .dot.inline { position: static; display: inline-block; vertical-align: 1px; opacity: 1; }
+  .day.in.s { background: linear-gradient(to right, transparent 50%, var(--sunk) 50%); }
+  .day.in.e { background: linear-gradient(to left, transparent 50%, var(--sunk) 50%); }
+  .day.in.s.e { background: none; }
+  .day::before { content: ""; position: absolute; left: 50%; top: 50%; width: 26px; height: 26px; transform: translate(-50%, -50%);
+    border-radius: 50%; }
+  .day:hover:not(:disabled)::before { background: var(--sunk); }
+  .day.end::before { background: var(--ink); }
+  .day.end { color: var(--panel); }
+  .day .n { position: relative; }
+  .day.today:not(.end)::after { content: ""; position: absolute; left: 50%; top: 50%; width: 26px; height: 26px;
+    transform: translate(-50%, -50%); border: 1px solid var(--focus); border-radius: 50%; }
   .foot { font-size: 11px; }
   @media (max-width: 760px) {
     .dr { position: static; }

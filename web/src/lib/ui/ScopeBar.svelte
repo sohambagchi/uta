@@ -8,8 +8,8 @@
   import TimeOfDay, { DAY } from "./TimeOfDay.svelte";
   import DateRange from "./DateRange.svelte";
 
-  let { crumbs = [], show = ["dates", "days", "hours", "modes", "otp"], single = false, extra }: {
-    crumbs?: [string, string | null][]; show?: string[]; single?: boolean; extra?: Snippet;
+  let { crumbs = [], show = ["dates", "days", "hours", "modes", "otp"], single = false, dateDays = [], extra }: {
+    crumbs?: [string, string | null][]; show?: string[]; single?: boolean; dateDays?: string[]; extra?: Snippet;
   } = $props();
 
   const days = $derived(app.days);
@@ -61,6 +61,13 @@
   {#if show.includes("dates")}
     <div class="f"><span class="lab">{single ? "Date" : "Dates"}</span>
       <DateRange {from} {to} {days} {single} onchange={(f, t) => router.set({ from: single ? null : f, to: t })} />
+    </div>
+  {/if}
+  {#if show.includes("date")}
+    <!-- one entity's own service days, in ?date= (no param = its latest day) -->
+    <div class="f"><span class="lab">Date</span>
+      <DateRange to={router.get("date")} days={dateDays} single
+        onchange={(_, d) => router.set({ date: d ?? dateDays.at(-1) ?? null })} />
     </div>
   {/if}
   {#if show.includes("days")}

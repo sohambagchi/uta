@@ -37,18 +37,7 @@
     : v?.trips.some((t) => t.mode === "rail") ? "Train" : v?.trips.some((t) => t.mode === "lrt" || t.mode === "streetcar") ? "Railcar" : "Vehicle");
 </script>
 
-<ScopeBar crumbs={[["Trips & vehicles", router.href("trips")], ["Vehicle " + vehicleId, null]]} show={[]}>
-  {#snippet extra()}
-    {#if v}
-      <label class="dt"><span class="lab">Date</span>
-        <select aria-label="Service date" value={v.date} disabled={v.days.length < 2}
-          onchange={(e) => router.set({ date: (e.currentTarget as HTMLSelectElement).value })}>
-          {#each v.days.includes(v.date) ? v.days : [...v.days, v.date] as d}<option value={d}>{dateLabel(d)}</option>{/each}
-        </select>
-      </label>
-    {/if}
-  {/snippet}
-</ScopeBar>
+<ScopeBar crumbs={[["Trips & vehicles", router.href("trips")], ["Vehicle " + vehicleId, null]]} show={v ? ["date"] : []} dateDays={v?.days ?? []} />
 {#if !v}
   <Loading error={res.error} />
 {:else}
@@ -127,8 +116,6 @@
 
 <style>
   .dim { opacity: .6; transition: opacity .15s; }
-  .dt { display: flex; align-items: center; gap: 4px; }
-  .lab { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; font-stretch: 90%; margin-right: 3px; }
   .sk { height: 420px; background: var(--sunk); border-radius: 4px; }
   .vid { display: inline-flex; align-items: center; height: 34px; padding: 0 10px; border-radius: 4px; border: 2px solid var(--ink);
     font-family: var(--mono); font-weight: 600; font-size: 16px; }
