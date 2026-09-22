@@ -27,3 +27,4 @@
 - [2026-09-21-2200-background-collector](changelog/2026-09-21-2200-background-collector.md) — collector service, migration guard, snapshots
 - [2026-09-21-2300-compact-history](changelog/2026-09-21-2300-compact-history.md) — schema v3
 - [2026-09-22-0025-analytics-dashboard](changelog/2026-09-22-0025-analytics-dashboard.md) — analytics dashboard
+- [2026-09-22-1100-station-search](changelog/2026-09-22-1100-station-search.md) — word-based station search

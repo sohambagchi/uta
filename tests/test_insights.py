@@ -77,6 +77,12 @@ def test_station_trip_vehicle_and_search(conn, tmp_path):
     assert c.get("/api/insights/vehicle/nope").status_code == 404
     found = c.get("/api/search", params={"q": "center"}).json()
     assert found["stations"][0]["name"].startswith("Center St")
+    names = lambda q: [x["name"] for x in c.get("/api/search", params={"q": q}).json()["stations"]]
+    assert names("9th avenue center street") == ["Center St / 9th Ave"]    # any order, abbreviations
+    assert names("main 1") == ["Main St / 1st Ave"]                        # prefix of the last word
+    assert names("other side") == ["Main St / 1st Ave"]                    # a member stop's full name
+    assert names("103") == ["Center St / 9th Ave"]                         # stop code
+    assert names("main 9th") == []
     assert c.get("/api/search", params={"q": "VT"}).json()["vehicles"] == ["VT1"]
 
 

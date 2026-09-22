@@ -1067,19 +1067,65 @@ def _error_kind(e: str) -> str:
 
 # ---------------------------------------------------------------- search
 
+_SEARCH_ABBR = {"west": "w", "east": "e", "north": "n", "south": "s", "street": "st", "avenue": "ave",
+                "boulevard": "blvd", "road": "rd", "drive": "dr", "lane": "ln", "parkway": "pkwy",
+                "highway": "hwy", "junction": "jct", "place": "pl", "court": "ct", "circle": "cir",
+                "center": "ctr", "centre": "ctr", "mount": "mt", "saint": "st", "and": ""}
+
+
+def _search_tokens(text: str) -> list[str]:
+    toks = re.split(r"[^a-z0-9]+", (text or "").lower())
+    return [t for t in (_SEARCH_ABBR.get(t, t) for t in toks) if t]
+
+
+def _station_index(ins: Insights) -> list[tuple]:
+    """(station_id, name, n_stops, words) per station; words: every member stop's name tokens,
+    both raw and abbreviated, plus stop codes, so '3500 South & 700 West' finds '700 W / 3500 S'."""
+    def build():
+        words = defaultdict(set)
+        for sid, name, code in ins.conn().execute(
+                "SELECT station_id, stop_name, stop_code FROM stops WHERE station_id IS NOT NULL"):
+            raw = [t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t]
+            words[sid].update(raw, _search_tokens(name))
+            if code:
+                words[sid].add(str(code).lower())
+        return [(sid, name, n, frozenset(words.get(sid, ())))
+                for sid, name, n in ins.conn().execute("SELECT station_id, name, n_stops FROM stations")]
+    return ins.memo(("station_index",), build, True)
+
+
+def search_stations(ins: Insights, text: str, limit: int = 12) -> list[dict]:
+    """Every query word must start a word of the station (any order); whole-word and name-order matches rank first."""
+    q = _search_tokens(text)
+    if not q:
+        return []
+    phrase = " ".join(q)
+    hits = []
+    for sid, name, n, words in _station_index(ins):
+        exact = 0
+        for t in q:
+            if t in words:
+                exact += 1
+            elif not any(w.startswith(t) for w in words):
+                break
+        else:
+            norm = " ".join(_search_tokens(name))
+            hits.append((-exact, not norm.startswith(phrase), phrase not in norm, -n, len(name), name, sid))
+    hits.sort()
+    return [{"station_id": h[6], "name": h[5], "n_stops": -h[3]} for h in hits[:limit]]
+
+
 def search(ins: Insights, text: str, limit: int = 8) -> dict:
     conn = ins.conn()
     ref = ins.ref()
     t = text.strip()
     if not t:
         return {"routes": [], "stations": [], "trips": [], "vehicles": []}
-    like = f"%{t}%"
     tl = t.lower()
     routes = [r for r in ref.routes.values()
               if tl == (r["route_short_name"] or "").lower() or tl in (r["route_long_name"] or "").lower()
               or (r["route_short_name"] or "").lower().startswith(tl)][:limit]
-    stations = [dict(r) for r in conn.execute(
-        "SELECT station_id, name, n_stops FROM stations WHERE name LIKE ? ORDER BY n_stops DESC, name LIMIT ?", (like, limit))]
+    stations = search_stations(ins, t)
     trips = [r[0] for r in conn.execute(
         "SELECT DISTINCT trip_id FROM trip_dim WHERE trip_id LIKE ? LIMIT ?", (t + "%", limit))]
     vehicles = [r[0] for r in conn.execute(
