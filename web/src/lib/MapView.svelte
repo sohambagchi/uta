@@ -7,7 +7,7 @@
   import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
   import { api, type NetworkLine, type Vehicle, type LngLat } from "./api";
   import { store } from "./store.svelte";
-  import { fmtSignedMin } from "./format";
+  import { delay, lineColor } from "./format";
   import { theme } from "./theme.svelte";
 
   maplibregl.setWorkerUrl(workerUrl);
@@ -21,13 +21,16 @@
   const ANIMATE_MS = 1200;
 
   // Delay status: reserved status colors, always paired with a label in the legend/popup.
+  // The diverging delay palette (early | on time | late ramp), same bins as every chart.
   const STATUS = [
-    { key: "early", label: "Early by 1+ min", color: "#fccc0a", test: (d: number) => d < -60 },
-    { key: "ok", label: "On time", color: "#6cbe45", test: (d: number) => d <= 300 },
-    { key: "late", label: "5–10 min late", color: "#ff8a1f", test: (d: number) => d <= 600 },
-    { key: "vlate", label: "10+ min late", color: "#ee352e", test: () => true },
+    { key: "early", label: "< −1:00", color: "#2b6cb0", test: (d: number) => d < -60 },
+    { key: "ok", label: "±1:00", color: "#9d9b94", test: (d: number) => d <= 60 },
+    { key: "l1", label: "+1–3", color: "#e0a030", test: (d: number) => d <= 180 },
+    { key: "l2", label: "+3–5", color: "#d2652a", test: (d: number) => d <= 300 },
+    { key: "l3", label: "+5–10", color: "#b1331f", test: (d: number) => d <= 600 },
+    { key: "l4", label: "> +10", color: "#6b1912", test: () => true },
   ];
-  const NO_DATA = { key: "none", label: "No estimate", color: "#a7a9ac" };
+  const NO_DATA = { key: "none", label: "no estimate", color: "#a7a9ac" };
   const statusOf = (d: number | null) => (d == null ? NO_DATA : STATUS.find((s) => s.test(d))!);
 
   let container: HTMLDivElement;
@@ -246,16 +249,17 @@
       return e;
     };
     const head = add(el, "div", "vc-head");
-    const badge = add(head, "span", "route-badge", v.route_short_name ?? "?");
-    badge.style.background = `#${route?.route_color || "888"}`;
-    badge.style.color = `#${route?.route_text_color || "fff"}`;
-    add(head, "strong", "", v.trip_headsign ? `to ${v.trip_headsign}` : "");
+    const badge = add(head, "span", "vc-badge", v.route_short_name ?? "?");
+    if (route && route.route_type !== 3) {
+      badge.style.background = lineColor(route.route_short_name, route.route_color);
+      badge.style.color = `var(--line-ink-${route.route_short_name}, #fff)`;
+    } else badge.classList.add("bus");
+    add(head, "strong", "", (v.trip_headsign ?? "").replace(/^To /, ""));
     const st = add(el, "div", "vc-status");
     add(st, "span", "vc-dot").style.background = s.color;
-    add(st, "strong", "", v.delay_s == null ? "No estimate" : Math.abs(v.delay_s) <= 60 ? "Right on time"
-      : `${fmtSignedMin(v.delay_s).replace("+", "")} min ${v.delay_s > 0 ? "late" : "early"}`);
-    add(el, "div", "vc-row", `Next stop: ${v.next_stop_name ?? "–"}`);
-    add(el, "div", "vc-meta", `Vehicle ${v.vehicle_id} · ${v.speed != null ? Math.round(v.speed * 2.237) + " mph · " : ""}seen ${age}s ago`);
+    add(st, "strong", "", v.delay_s == null ? "no estimate" : delay(v.delay_s));
+    add(el, "div", "vc-row", `next: ${v.next_stop_name ?? "—"}`);
+    add(el, "div", "vc-meta", `${v.vehicle_id} · ${v.speed != null ? Math.round(v.speed * 2.237) + " mph · " : ""}${age} s ago`);
     return el;
   }
 
@@ -329,7 +333,7 @@
       attributionControl: { compact: true },
     });
     map = m;
-    m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+    m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
     // basemap styles occasionally reference sprite images they don't ship; draw nothing for those
     m.setMissingStyleImageResolver((id) => {
       if (!m.hasImage(id)) m.addImage(id, { width: 1, height: 1, data: new Uint8Array(4) });
@@ -384,45 +388,47 @@
     <button aria-pressed={vehicleScope === "all"} onclick={() => (vehicleScope = "all")}>All vehicles</button>
     <button aria-pressed={vehicleScope === "compared"} onclick={() => (vehicleScope = "compared")}>Just my lines</button>
   </div>
-  <label class="small"><input type="checkbox" bind:checked={showNetwork} /> Route map</label>
+  <label class="chk"><input type="checkbox" bind:checked={showNetwork} /> Route map</label>
 </div>
 
 <div class="legend small" aria-label="Vehicle delay legend">
   <div class="title">
     <span class="live" class:off={liveError || !asOf}></span>
-    {#if liveError}Live feed unavailable
-    {:else if asOf}Live · {new Date(asOf * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-    {:else}Waiting for vehicles{/if}
+    {#if liveError}feed unavailable
+    {:else if asOf}Live · {new Date(asOf * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "America/Denver" })}
+    {:else}waiting for vehicles{/if}
   </div>
-  <div class="sub muted">Vehicles on your lines</div>
+  <div class="sub muted">on your lines</div>
   {#each [...STATUS, NO_DATA] as s}
-    <div class="row"><span class="dotk" style:background={s.color}></span><span>{s.label}</span><span class="n">{counts[s.key] ?? 0}</span></div>
+    <div class="lrow"><span class="dotk" style:background={s.color}></span><span>{s.label}</span><span class="n">{counts[s.key] ?? 0}</span></div>
   {/each}
-  <div class="row"><span class="dotk other"></span><span>Other lines</span><span class="n">{asOf ? others : ""}</span></div>
-  {#if !liveError && !asOf}<div class="muted hint">Is the collector running?</div>{/if}
+  <div class="lrow"><span class="dotk other"></span><span>Other lines</span><span class="n">{asOf ? others : ""}</span></div>
+  {#if !liveError && !asOf}<div class="hint">collector not running?</div>{/if}
 </div>
 
 <style>
   .map { position: absolute; inset: 0; }
-  .controls { position: absolute; top: 12px; right: 12px; display: flex; gap: 12px; align-items: center;
-    background: var(--surface); border-radius: 999px; padding: 4px 14px 4px 4px;
-    box-shadow: var(--shadow-pop); flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 80px); }
-  .controls label { display: flex; gap: 6px; align-items: center; color: var(--ink-2); white-space: nowrap; font-weight: 500;
-    cursor: pointer; }
-  .legend { position: absolute; left: 12px; bottom: 28px; background: var(--surface); border-radius: 14px;
-    padding: 12px 14px; display: grid; gap: 3px; color: var(--ink-2); min-width: 190px; box-shadow: var(--shadow-pop); }
-  .legend .title { font-weight: 700; color: var(--ink); font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
-  .legend .sub { font-size: 11.5px; margin-bottom: 4px; }
-  .legend .row { display: flex; align-items: center; }
-  .legend .n { margin-left: auto; padding-left: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .legend .hint { font-size: 11.5px; margin-top: 4px; }
-  .live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
-  .live.off { background: var(--no-data); }
-  .dotk { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 8px; flex: none;
-    box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--border); }
-  .dotk.other { width: 7px; height: 7px; margin: 0 10px 0 2px; background: var(--muted); opacity: .75; box-shadow: none; }
+  .controls { position: absolute; top: 10px; right: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    justify-content: flex-end; max-width: calc(100% - 20px); background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px 4px 4px; }
+  .controls .seg button { height: 26px; font-size: 12px; }
+  .chk { display: flex; gap: 6px; align-items: center; color: var(--ink-2); white-space: nowrap; font-size: 12px; cursor: pointer; }
+  .legend { position: absolute; left: 10px; top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; display: grid; gap: 2px; color: var(--ink-2); min-width: 150px; font-size: 11.5px; }
+  .legend .title { font-weight: 650; color: var(--ink); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .legend .sub { font-size: 11px; margin-bottom: 2px; }
+  .legend .lrow { display: flex; align-items: center; line-height: 1.5; }
+  .legend .n { margin-left: auto; padding-left: 12px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .legend .hint { font-size: 11px; margin-top: 3px; color: var(--warn-ink); background: var(--warn-bg); padding: 1px 6px; border-radius: 3px; }
+  .live { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+  .live.off { background: var(--faint); }
+  .dotk { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; flex: none; }
+  .dotk.other { width: 6px; height: 6px; margin: 0 9px 0 2px; background: var(--muted); opacity: .75; }
   :global(.vcard) { display: grid; gap: 5px; min-width: 190px; padding-right: 14px; }
   :global(.vc-head) { display: flex; align-items: center; gap: 8px; }
+  :global(.vc-badge) { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 20px; padding: 0 4px;
+    border-radius: 4px; font-weight: 700; font-size: 11px; font-stretch: 85%; }
+  :global(.vc-badge.bus) { border: 1.5px solid var(--ink); color: var(--ink); border-radius: 3px; }
   :global(.vc-status) { display: flex; align-items: center; gap: 7px; }
   :global(.vc-dot) { width: 10px; height: 10px; border-radius: 50%; flex: none; }
   :global(.vc-row) { color: var(--ink-2); }

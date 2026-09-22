@@ -16,6 +16,7 @@
 - [2026-09-21-2130-subway-design](adr/2026-09-21-2130-subway-design.md) — NYC-subway visual design, light by default
 - [2026-09-21-2200-background-collector](adr/2026-09-21-2200-background-collector.md) — collector as a pinned service; only it migrates
 - [2026-09-21-2300-compact-history](adr/2026-09-21-2300-compact-history.md) — schema v3: compact visits written once, trip vehicles, GPS blocks, tmpfs live state
+- [2026-09-22-0025-analytics-dashboard](adr/2026-09-22-0025-analytics-dashboard.md) — pages per level, per-day facts in memory, minimal text
 
 ## Changes
 
@@ -25,3 +26,4 @@
 - [2026-09-21-2130-subway-design](changelog/2026-09-21-2130-subway-design.md) — subway-map UI overhaul
 - [2026-09-21-2200-background-collector](changelog/2026-09-21-2200-background-collector.md) — collector service, migration guard, snapshots
 - [2026-09-21-2300-compact-history](changelog/2026-09-21-2300-compact-history.md) — schema v3
+- [2026-09-22-0025-analytics-dashboard](changelog/2026-09-22-0025-analytics-dashboard.md) — analytics dashboard
