@@ -8,8 +8,10 @@
 - [2026-09-21-2038-route-segments](adr/2026-09-21-2038-route-segments.md) — analytics model: route segments, stats in the browser
 - [2026-09-21-2038-web-build](adr/2026-09-21-2038-web-build.md) — Svelte + Vite dashboard, built by Nix
 - [2026-09-21-2038-maplibre](adr/2026-09-21-2038-maplibre.md) — MapLibre + OpenFreeMap map
+- [2026-09-21-2108-poll-cadence](adr/2026-09-21-2108-poll-cadence.md) — poll every 10 s, skip stale snapshots
 
 ## Changes
 
 - [2026-09-21-2016-data-foundations](changelog/2026-09-21-2016-data-foundations.md) — schema v2
 - [2026-09-21-2038-ui-overhaul](changelog/2026-09-21-2038-ui-overhaul.md) — new dashboard
+- [2026-09-21-2108-poll-cadence](changelog/2026-09-21-2108-poll-cadence.md) — 10 s polling

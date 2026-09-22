@@ -20,7 +20,8 @@ def main(argv=None):
     for name, help_ in (("collect", "poll realtime feeds forever"),
                         ("up", "collector + dashboard in one process")):
         s = sub.add_parser(name, help=help_)
-        s.add_argument("--interval", type=float, default=30.0, help="poll interval seconds")
+        s.add_argument("--interval", type=float, default=collector.POLL_INTERVAL_S,
+                       help="poll interval seconds (UTA updates its feeds every ~10 s)")
         s.add_argument("--no-positions", action="store_true", help="don't store vehicle GPS history")
         if name == "up":
             s.add_argument("--host", default="0.0.0.0", help="bind address (default: all interfaces)")

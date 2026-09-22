@@ -263,3 +263,27 @@ def test_migration_from_v1(tmp_path):
     assert c.execute("SELECT COUNT(*) FROM stops WHERE station_id IS NULL").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM route_stops").fetchone()[0] > 0
     assert db.get_meta(c, "schema_version") == str(db.SCHEMA_VERSION)
+
+
+def test_poll_skips_repeated_snapshots_and_samples_gps(conn, monkeypatch):
+    feeds = {}
+    monkeypatch.setattr(collector, "fetch_feed", lambda url: feeds[url])
+    monkeypatch.setattr(collector.time, "time", lambda: at(8, 2))
+    lookup, state = collector.StaticLookup(conn), collector.PollState()
+
+    def serve(ts, vehicle_ts):
+        feeds[collector.TRIP_UPDATE_URL] = trip_update_feed(ts, {"T1": [(3, at(8, 12), at(8, 12))]})
+        feeds[collector.VEHICLE_URL] = vehicle_feed(ts, [("VT1", "T1", vehicle_ts, 40.75, -111.89)])
+        return collector.poll_once(conn, lookup, state=state)
+
+    first = serve(at(8, 1), at(8, 1))
+    assert first["stop_updates"] == 1 and first["positions"] == 1 and "repeated_snapshot" not in first
+    # the other backend still serves the previous snapshot: nothing is written
+    stale = serve(at(8, 0, 58), at(8, 0, 58))
+    assert stale["repeated_snapshot"] == ["trip_updates", "vehicles"] and stale["stop_updates"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM vehicle_state").fetchone()[0] == 1
+    # 10 s later: live state updates, GPS history waits for POSITION_EVERY_S
+    nxt = serve(at(8, 1, 10), at(8, 1, 10))
+    assert nxt["active"] == 1 and nxt["positions"] == 0
+    assert serve(at(8, 1, 31), at(8, 1, 31))["positions"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM vehicle_positions").fetchone()[0] == 2

@@ -33,7 +33,7 @@ Everything runs through the flake's dev shell, which provides Python, Node, and 
 ```sh
 nix develop
 python -m uta import-gtfs        # one-off: download + load the static timetable (~10 s)
-python -m uta collect            # poll realtime feeds every 30 s (leave running)
+python -m uta collect            # poll realtime feeds every 10 s (leave running)
 python -m uta serve              # API + built dashboard on :8000
 npm --prefix web install         # once
 npm --prefix web run dev         # dashboard with hot reload on :5173, proxies /api to :8000
@@ -142,8 +142,11 @@ GROUP BY route, a.hour;
 ## Storage
 
 The static GTFS is about 32 MB. The collector adds about 160k observed stop events a day plus
-about 800k GPS pings, roughly 100 MB a day. Use `collect --no-positions` to skip GPS history;
-the live map doesn't need it.
+about 800k GPS pings (one per vehicle per 30 s), roughly 100 MB a day. Use `collect --no-positions`
+to skip GPS history; the live map doesn't need it.
+
+UTA regenerates both realtime feeds about every 10 s, so the collector polls every 10 s and the
+live map refreshes at the same rate ([ADR](docs/adr/2026-09-21-2108-poll-cadence.md)).
 
 ## Layout
 

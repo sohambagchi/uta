@@ -5,7 +5,7 @@
 
   outputs = { self, nixpkgs }:
     let
-      version = "0.2.3";
+      version = "0.2.4";
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       runtimeDeps = ps: with ps; [ fastapi uvicorn gtfs-realtime-bindings protobuf requests ];
@@ -18,7 +18,7 @@
           inherit version;
           src = ./web;
           nodejs = pkgs.nodejs_22;
-          npmDepsHash = "sha256-/YTGNDDrT8WwwVbc/oDIgDu3DbbvqhLmOXMv9SDPi+0=";
+          npmDepsHash = "sha256-OPlt1erSTXFGq+VOO58IyqORmIDr/L50i7BMeQ9C3do=";
           npmBuildFlags = [ "--" "--outDir" "dist" ];
           installPhase = ''
             runHook preInstall

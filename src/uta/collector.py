@@ -9,7 +9,7 @@ prediction made as the bus was at/leaving the stop -- i.e. the observed time.
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import lru_cache
 
@@ -24,6 +24,12 @@ log = logging.getLogger(__name__)
 VEHICLE_URL = "https://apps.rideuta.com/tms/gtfs/Vehicle"
 TRIP_UPDATE_URL = "https://apps.rideuta.com/tms/gtfs/TripUpdate"
 PURGE_EVERY_S = 300
+# UTA regenerates both feeds about every 10 s (measured 2026-09-21); polling faster
+# only re-reads the same snapshot, slower drops snapshots and stales observed times.
+POLL_INTERVAL_S = 10.0
+# GPS history keeps one ping per vehicle per this many seconds (vehicles report
+# every ~10 s); the live map uses every snapshot regardless.
+POSITION_EVERY_S = 30
 
 
 def fetch_feed(url: str) -> rt.FeedMessage:
@@ -219,9 +225,24 @@ def vehicle_rows(feed: rt.FeedMessage, lookup: StaticLookup):
         )
 
 
+@dataclass
+class PollState:
+    """What the previous polls saw, carried between poll_once calls.
+
+    Two out-of-sync servers answer the feed URLs, so a fetch can return an
+    older snapshot than the last one; those are skipped.
+    """
+    tu_ts: int = 0
+    veh_ts: int = 0
+    events: list = field(default_factory=list)            # last processed stop-event rows
+    position_ts: dict = field(default_factory=dict)       # vehicle_id -> last stored GPS ts
+
+
 def poll_once(conn: sqlite3.Connection, lookup: StaticLookup,
-              store_positions: bool = True) -> dict:
-    """Fetch both feeds and store them. Returns counts, or {"error": ...}."""
+              store_positions: bool = True, state: PollState | None = None) -> dict:
+    """Fetch both feeds and store any snapshot newer than the last one seen.
+    Returns counts, or {"error": ...}."""
+    state = state if state is not None else PollState()
     started = int(time.time())
     try:
         tu_feed = fetch_feed(TRIP_UPDATE_URL)
@@ -232,23 +253,39 @@ def poll_once(conn: sqlite3.Connection, lookup: StaticLookup,
             conn.execute("INSERT OR REPLACE INTO polls(ts, error) VALUES (?, ?)", (started, str(exc)))
         return {"error": str(exc)}
 
-    events = list(stop_event_rows(tu_feed, lookup))
-    vehicles = list(vehicle_rows(veh_feed, lookup))
-    live = list(vehicle_state_rows(veh_feed, tu_feed, events, lookup, int(time.time())))
+    tu_new = tu_feed.header.timestamp > state.tu_ts
+    veh_new = veh_feed.header.timestamp > state.veh_ts
+    events = list(stop_event_rows(tu_feed, lookup)) if tu_new else []
+    if tu_new:
+        state.tu_ts, state.events = tu_feed.header.timestamp, events
+    vehicles, live, positions = [], [], []
+    if veh_new:
+        state.veh_ts = veh_feed.header.timestamp
+        vehicles = list(vehicle_rows(veh_feed, lookup))
+        live = list(vehicle_state_rows(veh_feed, tu_feed, state.events, lookup, int(time.time())))
+        for row in vehicles:
+            vid, ts = row[0], row[1]
+            if ts - state.position_ts.get(vid, 0) >= POSITION_EVERY_S:
+                positions.append(row)
+                state.position_ts[vid] = ts
     with conn:
-        conn.executemany(UPSERT_EVENT, events)
-        conn.execute("DELETE FROM vehicle_state")
-        conn.executemany("INSERT OR REPLACE INTO vehicle_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", live)
-        if store_positions:
-            conn.executemany(
-                "INSERT OR IGNORE INTO vehicle_positions VALUES (?,?,?,?,?,?,?,?)", vehicles
-            )
+        if events:
+            conn.executemany(UPSERT_EVENT, events)
+        if veh_new:
+            conn.execute("DELETE FROM vehicle_state")
+            conn.executemany("INSERT OR REPLACE INTO vehicle_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", live)
+            if store_positions:
+                conn.executemany("INSERT OR IGNORE INTO vehicle_positions VALUES (?,?,?,?,?,?,?,?)", positions)
         conn.execute(
             "INSERT OR REPLACE INTO polls VALUES (?,?,?,?,?,NULL)",
             (started, tu_feed.header.timestamp, len(vehicles), len(tu_feed.entity), len(events)),
         )
-    return {"vehicles": len(vehicles), "active": len(live), "trip_updates": len(tu_feed.entity),
-            "stop_updates": len(events)}
+    stats = {"vehicles": len(vehicles), "active": len(live), "positions": len(positions),
+             "trip_updates": len(tu_feed.entity), "stop_updates": len(events)}
+    stale = [name for name, new in (("trip_updates", tu_new), ("vehicles", veh_new)) if not new]
+    if stale:
+        stats["repeated_snapshot"] = stale
+    return stats
 
 
 def purge(conn: sqlite3.Connection) -> int:
@@ -258,11 +295,12 @@ def purge(conn: sqlite3.Connection) -> int:
         return db.purge_stale_events(conn, since)
 
 
-def run(db_path: str | None = None, interval: float = 30.0, static_check_hours: float = 6.0,
+def run(db_path: str | None = None, interval: float = POLL_INTERVAL_S, static_check_hours: float = 6.0,
         store_positions: bool = True, stop_flag=None) -> None:
     conn = db.connect(db_path)
     db.init(conn)
     lookup = StaticLookup(conn)
+    state = PollState()
     last_static = last_purge = 0.0
     while stop_flag is None or not stop_flag.is_set():
         t0 = time.time()
@@ -276,7 +314,7 @@ def run(db_path: str | None = None, interval: float = 30.0, static_check_hours: 
                 if last_static == 0.0 and db.get_meta(conn, "gtfs_feed_version") is None:
                     time.sleep(interval)
                     continue
-        stats = poll_once(conn, lookup, store_positions=store_positions)
+        stats = poll_once(conn, lookup, store_positions=store_positions, state=state)
         if t0 - last_purge > PURGE_EVERY_S:
             stats["purged"] = purge(conn)
             last_purge = t0

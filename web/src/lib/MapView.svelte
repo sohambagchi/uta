@@ -16,7 +16,7 @@
     light: "https://tiles.openfreemap.org/styles/positron",
     dark: "https://tiles.openfreemap.org/styles/dark",
   };
-  const LIVE_EVERY_MS = 15_000;
+  const LIVE_EVERY_MS = 10_000;   // UTA regenerates the vehicle feed about every 10 s
   const ANIMATE_MS = 1200;
 
   // Delay status: reserved status colors, always paired with a label in the legend/popup.
