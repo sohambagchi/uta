@@ -1,6 +1,6 @@
 # Observed stop visits: lead window −120…+15 s, stale visits deleted
 
-**Status:** accepted
+**Status:** accepted; since schema v3 visits outside the window are kept, not deleted ([2026-09-21-2300-compact-history](2026-09-21-2300-compact-history.md))
 
 **Context:** A visit's stored time is the last prediction seen before the stop left the feed. The old rule (`lead_s <= 120`) accepted visits that dropped out early or lingered long after arrival. GPS check on 2026-09-21 data: distance from vehicle to stop at the recorded time, by final lead:
 

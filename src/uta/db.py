@@ -1,14 +1,19 @@
 """SQLite schema and connection helpers.
 
-Static GTFS tables are replaced wholesale on each import. The realtime-derived
-tables (stop_events, vehicle_positions) are append/upsert-only and denormalize
-route/stop/schedule info so history stays meaningful after the GTFS changes.
+Static GTFS tables are replaced wholesale on each import. Realtime history is
+append-only and compact (schema v3, see docs/adr/2026-09-21-2300-compact-history.md):
+repeated ids become small integer keys, times become small offsets, and trip facts
+(route, headsign, block, ...) live once per trip in trip_dim so history stays
+meaningful after the GTFS changes. Views reconstruct the old stop_events rows.
 """
 
 import logging
 import os
+import shutil
 import sqlite3
 import time
+from compression import zstd
+from datetime import date
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -31,12 +36,15 @@ def observed(alias: str = "") -> str:
 
 
 OBSERVED = observed()
-# A visit is final once it has been out of the feed this long.
-FINAL_AFTER_S = 600
+# A visit (or a trip's vehicle) is written once it has been out of the feed this long.
+FINAL_AFTER_S = 60
 # Live views only show vehicles that reported within this window.
 LIVE_MAX_AGE_S = 180
+# Pre-migration backups kept (zstd-compressed) next to the database.
+KEEP_BACKUPS = 3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+EPOCH = date(1970, 1, 1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -137,64 +145,131 @@ CREATE TABLE IF NOT EXISTS shapes (
     PRIMARY KEY (shape_id, seq)
 ) WITHOUT ROWID;
 
--- ---------- realtime history ----------
--- One row per trip-stop visit. Updated on every poll with the latest prediction;
--- once the bus passes the stop it leaves the feed and the last value is the
--- observed time. lead_s = obs_arrival - last_seen at the final sighting: small
--- (or negative) means the arrival had essentially happened when we last saw it.
-CREATE TABLE IF NOT EXISTS stop_events (
-    service_date    TEXT,       -- YYYY-MM-DD (GTFS service day, local)
-    trip_id         TEXT,
-    stop_sequence   INTEGER,
-    stop_id         TEXT,
-    route_id        TEXT,
+-- ---------- realtime history (schema v3) ----------
+-- Small integer keys for ids repeated in every history row.
+CREATE TABLE IF NOT EXISTS stop_keys    (key INTEGER PRIMARY KEY, stop_id TEXT);
+CREATE TABLE IF NOT EXISTS route_keys   (key INTEGER PRIMARY KEY, route_id TEXT);
+CREATE TABLE IF NOT EXISTS vehicle_keys (key INTEGER PRIMARY KEY, vehicle_id TEXT);
+CREATE INDEX IF NOT EXISTS stop_keys_id ON stop_keys(stop_id);
+CREATE INDEX IF NOT EXISTS route_keys_id ON route_keys(route_id);
+-- One row per distinct trip as it was when observed (the static trips table is replaced
+-- on every GTFS import). block_id is UTA's planned vehicle schedule.
+CREATE TABLE IF NOT EXISTS trip_dim (
+    key              INTEGER PRIMARY KEY,
+    feed_version     TEXT,
+    trip_id          TEXT,
+    route_id         TEXT,
     route_short_name TEXT,
-    direction_id    INTEGER,
-    trip_headsign   TEXT,
-    vehicle_id      TEXT,
-    sched_arrival   INTEGER,    -- epoch seconds
-    sched_departure INTEGER,
-    obs_arrival     INTEGER,    -- epoch seconds (last prediction seen)
-    obs_departure   INTEGER,
-    first_seen      INTEGER,
-    last_seen       INTEGER,    -- feed timestamp of last sighting
-    lead_s          INTEGER,
-    n_updates       INTEGER DEFAULT 1,
-    PRIMARY KEY (service_date, trip_id, stop_sequence)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS stop_events_stop ON stop_events(stop_id, service_date);
-CREATE INDEX IF NOT EXISTS stop_events_route_stop ON stop_events(route_id, stop_id, service_date);
+    direction_id     INTEGER,
+    trip_headsign    TEXT,
+    block_id         TEXT,
+    shape_id         TEXT,
+    service_id       TEXT
+);
+CREATE INDEX IF NOT EXISTS trip_dim_trip ON trip_dim(trip_id);
+-- (trip_id, route_id) as the vehicle feed named them, for GPS pings.
+CREATE TABLE IF NOT EXISTS gps_trips (key INTEGER PRIMARY KEY, trip_id TEXT, route_id TEXT);
 
-CREATE TABLE IF NOT EXISTS vehicle_positions (
-    vehicle_id TEXT,
-    ts         INTEGER,         -- epoch seconds (vehicle timestamp)
-    trip_id    TEXT,
-    route_id   TEXT,
-    lat        REAL,
-    lon        REAL,
-    bearing    REAL,
-    speed      REAL,            -- m/s
-    PRIMARY KEY (vehicle_id, ts)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS vehicle_positions_ts ON vehicle_positions(ts);
-
--- Vehicles in the latest poll that are on a trip and reported recently.
--- Replaced wholesale on every poll; live views read only this table.
-CREATE TABLE IF NOT EXISTS vehicle_state (
-    vehicle_id   TEXT PRIMARY KEY,
-    ts           INTEGER,       -- vehicle timestamp
-    trip_id      TEXT,
-    route_id     TEXT,
-    direction_id INTEGER,
-    headsign     TEXT,
-    lat          REAL,
-    lon          REAL,
-    bearing      REAL,
-    speed        REAL,          -- m/s
-    delay_s      INTEGER,       -- predicted - scheduled arrival at next stop
-    next_stop_id TEXT
+-- Service days: day = days since 1970-01-01; origin = epoch of GTFS "midnight" (noon - 12 h).
+CREATE TABLE IF NOT EXISTS days (
+    day          INTEGER PRIMARY KEY,
+    service_date TEXT,          -- YYYY-MM-DD
+    origin       INTEGER
 );
 
+-- One row per trip-stop visit, written once it has left the feed (FINAL_AFTER_S).
+-- The stored time is the last prediction seen, so it is the observed time only when
+-- lead_s is inside the observed window (see OBSERVED); visits outside it are kept too.
+-- Clustered for the segment query (route, stop, day); visits_at serves "what passed
+-- this stop between t0 and t1". stop_events (view) rebuilds the v2 columns.
+CREATE TABLE IF NOT EXISTS visits (
+    route       INTEGER NOT NULL,   -- route_keys
+    stop        INTEGER NOT NULL,   -- stop_keys
+    day         INTEGER NOT NULL,   -- days
+    trip        INTEGER NOT NULL,   -- trip_dim
+    seq         INTEGER NOT NULL,   -- stop_sequence
+    vehicle     INTEGER,            -- vehicle_keys
+    arr         INTEGER,            -- observed arrival, seconds after days.origin
+    dwell       INTEGER,            -- observed departure - arrival
+    delay       INTEGER,            -- observed - scheduled arrival (NULL: no schedule)
+    sched_dwell INTEGER,            -- scheduled departure - arrival
+    lead_s      INTEGER,            -- observed arrival - last sighting
+    span        INTEGER,            -- last - first sighting
+    n_updates   INTEGER,
+    PRIMARY KEY (route, stop, day, trip, seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS visits_at ON visits(stop, day, arr);
+
+-- Per trip and day: visits written and how many are observed. Feeds day_stats.
+CREATE TABLE IF NOT EXISTS trip_days (
+    day        INTEGER,
+    trip       INTEGER,
+    n_visits   INTEGER,
+    n_observed INTEGER,
+    PRIMARY KEY (day, trip)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS day_stats (
+    day        INTEGER PRIMARY KEY,
+    n_visits   INTEGER,
+    n_observed INTEGER,
+    n_trips    INTEGER          -- trips with at least one observed visit
+);
+
+-- Which vehicle ran a trip, from TripUpdates (the vehicle feed can name a vehicle's next
+-- trip early). One row per stretch with the same vehicle; seq_* is the trip's next stop
+-- at the start and end of the stretch. A trip with two rows changed vehicles.
+CREATE TABLE IF NOT EXISTS trip_vehicle (
+    day       INTEGER,
+    trip      INTEGER,          -- trip_dim
+    t_first   INTEGER,          -- epoch
+    t_last    INTEGER,
+    vehicle   INTEGER,          -- vehicle_keys
+    seq_first INTEGER,
+    seq_last  INTEGER,
+    PRIMARY KEY (day, trip, t_first)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS trip_vehicle_vehicle ON trip_vehicle(vehicle, day);
+
+-- GPS pings (one per vehicle per POSITION_EVERY_S). Appended here, then whole days are
+-- sealed into gps_blocks (see gps.py). trip is the vehicle feed's trip, tu_trip the
+-- trip TripUpdates assigns the vehicle (both gps_trips).
+CREATE TABLE IF NOT EXISTS gps_recent (
+    ts      INTEGER NOT NULL,
+    vehicle INTEGER NOT NULL,
+    trip    INTEGER,
+    tu_trip INTEGER,
+    lat     REAL,
+    lon     REAL,
+    bearing REAL,
+    speed   REAL,               -- m/s
+    PRIMARY KEY (ts, vehicle)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS gps_blocks (
+    day     INTEGER,            -- gps.gps_day
+    vehicle INTEGER,
+    n       INTEGER,
+    t_first INTEGER,
+    t_last  INTEGER,
+    data    BLOB,
+    PRIMARY KEY (day, vehicle)  -- a rowid table: packs KB-sized blobs better than WITHOUT ROWID
+);
+
+-- Visits written since the last merge into visits (every 6 h, collector.MERGE_EVERY_S).
+-- Appending here and merging in key order touches far fewer pages than inserting each
+-- visit into the clustered table as it finishes. Readers see both (visits_all).
+CREATE TABLE IF NOT EXISTS visits_new (
+    route INTEGER, stop INTEGER, day INTEGER, trip INTEGER, seq INTEGER, vehicle INTEGER,
+    arr INTEGER, dwell INTEGER, delay INTEGER, sched_dwell INTEGER, lead_s INTEGER, span INTEGER,
+    n_updates INTEGER
+);
+
+-- Collector state that must survive a restart (in-flight visits and trips), zstd JSON.
+CREATE TABLE IF NOT EXISTS collector_state (
+    name TEXT PRIMARY KEY,
+    data BLOB
+);
+
+-- Poll log (written in batches; the latest poll is in the live database).
 CREATE TABLE IF NOT EXISTS polls (
     ts            INTEGER PRIMARY KEY,   -- wall clock of poll
     feed_ts       INTEGER,
@@ -206,13 +281,39 @@ CREATE TABLE IF NOT EXISTS polls (
 
 """
 
+# The v2 stop_events columns, rebuilt from visits (also used to verify the v3 migration).
+STOP_EVENTS_VIEW = """
+SELECT d.service_date, t.trip_id, v.seq AS stop_sequence, sk.stop_id, t.route_id, t.route_short_name,
+       t.direction_id, t.trip_headsign, vk.vehicle_id,
+       d.origin + v.arr - v.delay AS sched_arrival,
+       d.origin + v.arr - v.delay + v.sched_dwell AS sched_departure,
+       d.origin + v.arr AS obs_arrival,
+       d.origin + v.arr + v.dwell AS obs_departure,
+       d.origin + v.arr - v.lead_s - v.span AS first_seen,
+       d.origin + v.arr - v.lead_s AS last_seen,
+       v.lead_s, v.n_updates
+FROM visits_all v
+JOIN days d USING (day)
+JOIN trip_dim t ON t.key = v.trip
+JOIN stop_keys sk ON sk.key = v.stop
+LEFT JOIN vehicle_keys vk ON vk.key = v.vehicle
+"""
+
 # Indexes on migrated columns and views: run after migrate(). Views are always
 # recreated so definition changes apply to existing databases.
 POST_SCHEMA = f"""
 CREATE INDEX IF NOT EXISTS stops_station ON stops(station_id);
 
--- Stop visits we consider actually observed (see OBSERVED).
 DROP VIEW IF EXISTS observed_stop_events;
+DROP VIEW IF EXISTS stop_events;
+DROP VIEW IF EXISTS visits_all;
+CREATE VIEW visits_all AS SELECT * FROM visits UNION ALL SELECT * FROM visits_new;
+
+-- The v2 stop_events columns, rebuilt from visits.
+CREATE VIEW stop_events AS
+{STOP_EVENTS_VIEW};
+
+-- Stop visits we consider actually observed (see OBSERVED).
 CREATE VIEW observed_stop_events AS
 SELECT e.*,
        s.stop_name,
@@ -235,6 +336,53 @@ JOIN trips t USING (trip_id)
 JOIN routes r USING (route_id)
 JOIN stops s USING (stop_id);
 """
+
+
+# Live state, rewritten on every poll. It lives in its own small database on tmpfs
+# ($XDG_RUNTIME_DIR) so the 10 s rewrites never reach the disk; it is lost on reboot,
+# which is fine because it is only the current poll.
+LIVE_SCHEMA = """
+-- Vehicles in the latest poll that are on a trip and reported recently.
+CREATE TABLE IF NOT EXISTS vehicle_state (
+    vehicle_id   TEXT PRIMARY KEY,
+    ts           INTEGER,       -- vehicle timestamp
+    trip_id      TEXT,
+    route_id     TEXT,
+    direction_id INTEGER,
+    headsign     TEXT,
+    lat          REAL,
+    lon          REAL,
+    bearing      REAL,
+    speed        REAL,          -- m/s
+    delay_s      INTEGER,       -- predicted - scheduled arrival at next stop
+    next_stop_id TEXT
+);
+-- The latest poll (same columns as polls) and the latest one without an error.
+CREATE TABLE IF NOT EXISTS last_poll (
+    kind TEXT PRIMARY KEY,      -- 'last' | 'ok'
+    ts INTEGER, feed_ts INTEGER, n_vehicles INTEGER, n_trip_updates INTEGER, n_stop_updates INTEGER, error TEXT
+);
+"""
+
+
+def live_path(path: str | None = None) -> str:
+    """Live-state database for the history database at path ($UTA_LIVE_DIR, else $XDG_RUNTIME_DIR)."""
+    import hashlib
+    import tempfile
+    base = os.environ.get("UTA_LIVE_DIR") or os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    digest = hashlib.sha1(os.path.realpath(path or DEFAULT_DB).encode()).hexdigest()[:12]
+    return os.path.join(base, f"uta-live-{digest}.db")
+
+
+def connect_live(path: str | None = None, readonly: bool = False) -> sqlite3.Connection | None:
+    """The live database; None when reading and the collector hasn't created it."""
+    lp = live_path(path)
+    if readonly and not os.path.exists(lp):
+        return None
+    conn = connect(lp, readonly=readonly)
+    if not readonly:
+        conn.executescript(LIVE_SCHEMA)
+    return conn
 
 
 def connect(path: str | None = None, readonly: bool = False) -> sqlite3.Connection:
@@ -271,12 +419,40 @@ def backup(conn: sqlite3.Connection, dest: str) -> None:
         out.close()
 
 
+def backup_compressed(conn: sqlite3.Connection, dest: str) -> str:
+    """Online backup to dest + '.zst' (zstd); returns that path. Restore with restore_backup."""
+    tmp, out = dest + ".tmp", dest + ".zst"
+    backup(conn, tmp)
+    try:
+        with open(tmp, "rb") as src, zstd.open(out, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+    finally:
+        os.remove(tmp)
+    return out
+
+
+def restore_backup(src: str, dest: str) -> None:
+    with zstd.open(src, "rb") as fh, open(dest, "wb") as out:
+        shutil.copyfileobj(fh, out, 1 << 20)
+
+
+def prune_backups(path: str, keep: int = KEEP_BACKUPS) -> list[Path]:
+    """Delete all but the newest `keep` pre-migration backups of the database at path."""
+    p = Path(path)
+    baks = sorted(p.parent.glob(p.name + ".pre-v*.bak*"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in baks[keep:]:
+        log.warning("deleting old backup %s", f)
+        f.unlink()
+    return baks[keep:]
+
+
 def init(conn: sqlite3.Connection, allow_migrate: bool = True) -> None:
     """Create the schema and bring the database up to SCHEMA_VERSION.
 
     Refuses a database newer than this code. With allow_migrate=False, also refuses one that
     needs migrating, so a dev server can't migrate the live database under the collector.
-    Before migrating, the database is backed up next to itself (migrations can purge data).
+    Before migrating, the database is backed up next to itself (zstd; the newest
+    KEEP_BACKUPS are kept), since migrations can purge or rewrite data.
     """
     version = schema_version(conn)
     if version is not None and version > SCHEMA_VERSION:
@@ -293,47 +469,64 @@ def init(conn: sqlite3.Connection, allow_migrate: bool = True) -> None:
         if path:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             dest = f"{path}.pre-v{SCHEMA_VERSION}-{stamp}.bak"
-            log.warning("backing up schema v%d database to %s before migrating", version, dest)
-            backup(conn, dest)
+            log.warning("backing up schema v%d database to %s.zst before migrating", version, dest)
+            backup_compressed(conn, dest)
+            prune_backups(path)
     conn.executescript(SCHEMA)
-    migrate(conn)
+    rewritten = migrate(conn)
     conn.executescript(POST_SCHEMA)
     conn.commit()
+    if rewritten:
+        log.warning("reclaiming space after migration (VACUUM)")
+        conn.execute("VACUUM")
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def migrate(conn: sqlite3.Connection) -> None:
-    """Bring an existing database up to SCHEMA_VERSION."""
+def _is_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+def migrate(conn: sqlite3.Connection) -> bool:
+    """Bring an existing database up to SCHEMA_VERSION, atomically.
+    Returns True if history was rewritten (worth a VACUUM)."""
     version = int(get_meta(conn, "schema_version") or 1)
     if version >= SCHEMA_VERSION:
-        return
-    if version < 2:
-        if "station_id" not in _columns(conn, "stops"):
-            conn.execute("ALTER TABLE stops ADD COLUMN station_id TEXT")
-        conn.execute("DROP INDEX IF EXISTS stop_events_route")
-        purge_stale_events(conn, since=None)
-        if conn.execute("SELECT 1 FROM stops LIMIT 1").fetchone():
-            from . import gtfs_static
-            gtfs_static.derive(conn)
-    set_meta(conn, "schema_version", str(SCHEMA_VERSION))
-    conn.commit()
+        return False
+    rewritten = False
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN")
+    try:
+        if version < 2:
+            if "station_id" not in _columns(conn, "stops"):
+                conn.execute("ALTER TABLE stops ADD COLUMN station_id TEXT")
+            conn.execute("DROP INDEX IF EXISTS stop_events_route")
+            if _is_table(conn, "stop_events"):
+                _purge_v2(conn)
+            if conn.execute("SELECT 1 FROM stops LIMIT 1").fetchone():
+                from . import gtfs_static
+                gtfs_static.derive(conn)
+        if version < 3:
+            conn.execute("DROP TABLE IF EXISTS vehicle_state")    # moved to the live database
+            if _is_table(conn, "stop_events"):
+                from . import history
+                history.migrate_v2(conn)
+                rewritten = True
+        set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return rewritten
 
 
-def purge_stale_events(conn: sqlite3.Connection, since: str | None, now: int | None = None) -> int:
-    """Delete finalized stop visits that fall outside the observed window.
-
-    since: only look at service dates >= this (YYYY-MM-DD); None scans everything.
-    """
-    cutoff = (now or int(time.time())) - FINAL_AFTER_S
-    where = f"last_seen < ? AND NOT ({OBSERVED})"
-    params: list = [cutoff]
-    if since:
-        where = "service_date >= ? AND " + where
-        params.insert(0, since)
-    return conn.execute(f"DELETE FROM stop_events WHERE {where}", params).rowcount
+def _purge_v2(conn: sqlite3.Connection) -> int:
+    """The v2 migration's cleanup: delete finalized stop visits outside the observed window."""
+    cutoff = int(time.time()) - 600
+    return conn.execute(f"DELETE FROM stop_events WHERE last_seen < ? AND NOT ({OBSERVED})", (cutoff,)).rowcount
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

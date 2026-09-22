@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import signal
 import sys
 import threading
 
@@ -66,7 +67,11 @@ def run(args):
         db.backup(conn, args.dest)
         print(f"{args.db} -> {args.dest}")
     elif args.cmd == "collect":
-        collector.run(args.db, interval=args.interval, store_positions=not args.no_positions)
+        # stop cleanly on SIGTERM (systemd) / Ctrl-C so in-flight visits are saved
+        stop = threading.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: stop.set())
+        collector.run(args.db, interval=args.interval, store_positions=not args.no_positions, stop_flag=stop)
     elif args.cmd in ("serve", "up"):
         import uvicorn
 
@@ -74,14 +79,19 @@ def run(args):
 
         # built first so only one of server/collector ever runs a migration
         app = create_app(args.db, migrate=args.cmd == "up" or args.migrate)
+        thread = None
         if args.cmd == "up":
             stop = threading.Event()
-            threading.Thread(
+            thread = threading.Thread(
                 target=collector.run, daemon=True, name="collector",
                 kwargs=dict(db_path=args.db, interval=args.interval,
                             store_positions=not args.no_positions, stop_flag=stop),
-            ).start()
+            )
+            thread.start()
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        if thread is not None:
+            stop.set()          # save in-flight visits before exiting
+            thread.join(timeout=30)
 
 
 if __name__ == "__main__":

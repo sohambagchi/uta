@@ -41,6 +41,13 @@ def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
             c = local.conn = db.connect(db_path, readonly=True)
         return c
 
+    def live():
+        """Read-only connection to the collector's live database, or None if it isn't running."""
+        c = getattr(local, "live", None)
+        if c is None:
+            c = local.live = db.connect_live(db_path, readonly=True)
+        return c
+
     init_conn = db.connect(db_path)
     try:
         db.init(init_conn, allow_migrate=migrate)
@@ -49,22 +56,34 @@ def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
 
     @app.get("/api/status")
     def status():
-        c = conn()
-        last = c.execute("SELECT * FROM polls ORDER BY ts DESC LIMIT 1").fetchone()
-        last_ok = c.execute("SELECT ts FROM polls WHERE error IS NULL ORDER BY ts DESC LIMIT 1").fetchone()
-        span = c.execute(
-            "SELECT MIN(service_date) AS first, MAX(service_date) AS last, COUNT(*) AS n, "
-            f"COUNT(DISTINCT service_date || trip_id) AS trips FROM stop_events WHERE {db.OBSERVED}"
-        ).fetchone()
+        c, lc = conn(), live()
+        polls = {r["kind"]: r for r in lc.execute("SELECT * FROM last_poll")} if lc else {}
+        last, last_ok = polls.get("last"), polls.get("ok")
+        # Constant-time however much history there is: day_stats is kept by the collector
+        # for merged visits; staged visits (<= 6 h) are counted here.
+        merged = c.execute(
+            "SELECT MIN(d.service_date) AS first, MAX(d.service_date) AS last, "
+            "COALESCE(SUM(s.n_observed), 0) AS n, COALESCE(SUM(s.n_trips), 0) AS trips "
+            "FROM day_stats s JOIN days d USING (day) WHERE s.n_observed > 0").fetchone()
+        staged = c.execute(
+            f"""SELECT MIN(d.service_date) AS first, MAX(d.service_date) AS last, COUNT(*) AS n,
+                       COUNT(DISTINCT CASE WHEN NOT EXISTS (
+                           SELECT 1 FROM trip_days td WHERE td.day = v.day AND td.trip = v.trip AND td.n_observed > 0)
+                       THEN v.day || ':' || v.trip END) AS trips
+                FROM visits_new v JOIN days d USING (day) WHERE {db.observed("v")}""").fetchone()
+        firsts = [x for x in (merged["first"], staged["first"]) if x]
+        lasts = [x for x in (merged["last"], staged["last"]) if x]
+        span = {"first": min(firsts, default=None), "last": max(lasts, default=None),
+                "n": merged["n"] + staged["n"], "trips": merged["trips"] + staged["trips"]}
         return {
             "gtfs_feed_version": db.get_meta(c, "gtfs_feed_version"),
             "gtfs_imported_at": db.get_meta(c, "gtfs_imported_at"),
-            "observed": dict(span),
-            "active_vehicles": c.execute(
+            "observed": span,
+            "active_vehicles": lc.execute(
                 "SELECT COUNT(*) FROM vehicle_state WHERE ts >= ?",
-                (int(time.time()) - db.LIVE_MAX_AGE_S,)).fetchone()[0],
-            "last_poll": dict(last) if last else None,
-            "last_ok_poll_age_s": int(time.time() - last_ok[0]) if last_ok else None,
+                (int(time.time()) - db.LIVE_MAX_AGE_S,)).fetchone()[0] if lc else 0,
+            "last_poll": {k: last[k] for k in last.keys() if k != "kind"} if last else None,
+            "last_ok_poll_age_s": int(time.time() - last_ok["ts"]) if last_ok else None,
         }
 
     @app.get("/api/routes")
@@ -112,21 +131,32 @@ def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
         if route_ids:
             where.append(f"v.route_id IN ({','.join('?' * len(route_ids))})")
             params += route_ids
-        rows = conn().execute(
+        lc = live()
+        if lc is None:
+            return {"as_of": None, "vehicles": []}
+        rows = [dict(r) for r in lc.execute(
             f"""
             SELECT v.vehicle_id, v.ts, v.trip_id, v.route_id, v.direction_id, v.lat, v.lon,
-                   v.bearing, v.speed, v.delay_s, v.next_stop_id, v.headsign AS trip_headsign,
-                   r.route_short_name, r.route_long_name, r.route_color, r.route_type,
-                   s.stop_name AS next_stop_name
+                   v.bearing, v.speed, v.delay_s, v.next_stop_id, v.headsign AS trip_headsign
             FROM vehicle_state v
-            LEFT JOIN routes r ON r.route_id = v.route_id
-            LEFT JOIN stops s ON s.stop_id = v.next_stop_id
             WHERE {" AND ".join(where)}
             """,
             params,
-        ).fetchall()
+        )]
+        # route and stop names live in the history database
+        c = conn()
+        route_info = {r["route_id"]: r for r in c.execute(
+            "SELECT route_id, route_short_name, route_long_name, route_color, route_type FROM routes")}
+        stop_ids = sorted({r["next_stop_id"] for r in rows if r["next_stop_id"]})
+        stop_names = dict(c.execute(
+            f"SELECT stop_id, stop_name FROM stops WHERE stop_id IN ({','.join('?' * len(stop_ids))})", stop_ids))
+        for r in rows:
+            info = route_info.get(r["route_id"])
+            for k in ("route_short_name", "route_long_name", "route_color", "route_type"):
+                r[k] = info[k] if info else None
+            r["next_stop_name"] = stop_names.get(r["next_stop_id"])
         as_of = max((r["ts"] for r in rows), default=None)
-        return {"as_of": as_of, "vehicles": [dict(r) for r in rows]}
+        return {"as_of": as_of, "vehicles": rows}
 
     if (STATIC_DIR / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")

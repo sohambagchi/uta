@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from google.transit import gtfs_realtime_pb2 as rt
 
-from uta import analytics, collector, db, gtfs_static
+from uta import analytics, collector, db, gps, gtfs_static, history
 from uta.server import create_app
 from uta.timeutil import infer_service_date, service_day_origin
 
@@ -45,6 +45,11 @@ def make_zip() -> bytes:
     return buf.getvalue()
 
 
+@pytest.fixture(autouse=True)
+def live_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("UTA_LIVE_DIR", str(tmp_path))
+
+
 @pytest.fixture
 def conn(tmp_path):
     c = db.connect(str(tmp_path / "t.db"))
@@ -71,10 +76,29 @@ def trip_update_feed(feed_ts, trips):
     return msg
 
 
-def ingest(conn, feed):
-    lookup = collector.StaticLookup(conn)
-    with conn:
-        conn.executemany(collector.UPSERT_EVENT, list(collector.stop_event_rows(feed, lookup)))
+class Feeder:
+    """Runs TripUpdates feeds through the collector's tracker and writer, without the network."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.lookup = collector.StaticLookup(conn)
+        self.tracker = collector.Tracker()
+        self.history = history.History(conn)
+
+    def __call__(self, feed):
+        self._apply(list(collector.stop_event_rows(feed, self.lookup)), feed.header.timestamp)
+
+    def flush(self, ts):
+        """A later poll with nothing in the feed: everything tracked becomes final and is merged."""
+        self._apply([], ts)
+        with self.conn:
+            self.history.merge_staged()
+
+    def _apply(self, events, ts):
+        final, runs = self.tracker.update(events, ts)
+        with self.conn:
+            self.history.stage_visits(final)
+            self.history.write_trip_runs(runs)
 
 
 MON = date(2026, 9, 21)
@@ -102,12 +126,18 @@ def test_service_date_inference():
 
 
 def test_observed_pipeline(conn):
+    ingest = Feeder(conn)
     # poll 1: bus approaching A, predictions for A and B
-    ingest(conn, trip_update_feed(at(7, 58), {"T1": [(1, at(8, 1), at(8, 1, 30)), (3, at(8, 12), at(8, 12))]}))
+    ingest( trip_update_feed(at(7, 58), {"T1": [(1, at(8, 1), at(8, 1, 30)), (3, at(8, 12), at(8, 12))]}))
     # poll 2: at A (departure updated), B prediction updated
-    ingest(conn, trip_update_feed(at(8, 1, 20), {"T1": [(1, at(8, 1), at(8, 1, 40)), (3, at(8, 13), at(8, 13))]}))
-    # poll 3: A has left the feed; B imminent
-    ingest(conn, trip_update_feed(at(8, 13, 10), {"T1": [(3, at(8, 13, 20), at(8, 13, 30))]}))
+    ingest( trip_update_feed(at(8, 1, 20), {"T1": [(1, at(8, 1), at(8, 1, 40)), (3, at(8, 13), at(8, 13))]}))
+    # poll 3: A has left the feed (written: gone for > FINAL_AFTER_S); B imminent (still in flight)
+    ingest(trip_update_feed(at(8, 13, 10), {"T1": [(3, at(8, 13, 20), at(8, 13, 30))]}))
+    # staged, not merged yet, and already visible
+    assert [r[0] for r in conn.execute("SELECT stop_sequence FROM stop_events")] == [1]
+    assert conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0] == 0
+    assert analytics.segment(conn, "R1", "A", "M")["observed"]["dur"] == []
+    ingest.flush(at(9))
 
     rows = {r["stop_sequence"]: r for r in conn.execute("SELECT * FROM stop_events")}
     assert rows[1]["obs_departure"] == at(8, 1, 40)
@@ -125,10 +155,14 @@ def test_observed_pipeline(conn):
     assert obs["minute"] == [8 * 60 + 1] and obs["dow"] == [0] and obs["date"] == ["2026-09-21"]
 
 
-def test_stale_predictions_are_not_observed(conn):
+def test_stale_predictions_are_kept_but_not_observed(conn):
     # only ever saw a far-future prediction for B (e.g. trip dropped from feed)
-    ingest(conn, trip_update_feed(at(7, 0), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
+    ingest = Feeder(conn)
+    ingest(trip_update_feed(at(7, 0), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
+    ingest.flush(at(9))
     assert analytics.segment(conn, "R1", "A", "B")["observed"]["dur"] == []
+    assert conn.execute("SELECT COUNT(*) FROM stop_events").fetchone()[0] == 2
+    assert tuple(conn.execute("SELECT n_visits, n_observed, n_trips FROM day_stats").fetchone()) == (2, 0, 0)
 
 
 def test_segment_scheduled_and_shape(conn):
@@ -198,17 +232,55 @@ def test_route_stops_merge_patterns(conn):
     assert [tuple(r) for r in rows] == [("A", 3), ("M", 1), ("B", 3)]
 
 
-def test_observed_window_and_purge(conn):
+def test_observed_window_keeps_all_visits(conn):
     # A left the feed 60 s before its predicted arrival: an early-dropped prediction
-    ingest(conn, trip_update_feed(at(7, 59), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
-    ingest(conn, trip_update_feed(at(8, 9, 50), {"T1": [(3, at(8, 10), at(8, 10))]}))
+    ingest = Feeder(conn)
+    ingest(trip_update_feed(at(7, 59), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
+    ingest(trip_update_feed(at(8, 9, 50), {"T1": [(3, at(8, 10), at(8, 10))]}))
+    ingest.flush(at(9))
     lead = dict(conn.execute("SELECT stop_sequence, lead_s FROM stop_events"))
     assert lead == {1: 60, 3: 10}
     assert conn.execute("SELECT COUNT(*) FROM observed_stop_events").fetchone()[0] == 1
-    # not final yet: nothing purged
-    assert db.purge_stale_events(conn, "2026-09-20", now=at(8, 5)) == 0
-    assert db.purge_stale_events(conn, "2026-09-20", now=at(9)) == 1
-    assert [r[0] for r in conn.execute("SELECT stop_sequence FROM stop_events")] == [3]
+    assert tuple(conn.execute("SELECT n_visits, n_observed, n_trips FROM day_stats").fetchone()) == (2, 1, 1)
+
+
+def test_visit_that_returns_to_the_feed_is_merged(conn):
+    ingest = Feeder(conn)
+    ingest(trip_update_feed(at(7, 50), {"T1": [(3, at(8, 10), at(8, 10))]}))
+    ingest.flush(at(8))                     # dropped out: written once
+    ingest(trip_update_feed(at(8, 9, 55), {"T1": [(3, at(8, 10, 5), at(8, 10, 5))]}))
+    ingest.flush(at(9))
+    [r] = conn.execute("SELECT * FROM stop_events").fetchall()
+    assert (r["obs_arrival"], r["first_seen"], r["last_seen"], r["n_updates"]) == (
+        at(8, 10, 5), at(7, 50), at(8, 9, 55), 2)
+    assert tuple(conn.execute("SELECT n_visits, n_observed FROM day_stats").fetchone()) == (1, 1)
+
+
+def test_trip_vehicle_records_a_swap(conn):
+    ingest = Feeder(conn)
+    feed = trip_update_feed(at(7, 55), {"T1": [(1, at(8), at(8)), (2, at(8, 5), at(8, 5)), (3, at(8, 10), at(8, 10))]})
+    ingest(feed)
+    feed = trip_update_feed(at(8, 3), {"T1": [(2, at(8, 5), at(8, 5)), (3, at(8, 10), at(8, 10))]})
+    feed.entity[0].trip_update.vehicle.id = "SPARE"
+    ingest(feed)
+    ingest.flush(at(9))
+    rows = conn.execute(
+        "SELECT vk.vehicle_id, tv.t_first, tv.t_last, tv.seq_first, tv.seq_last, t.block_id FROM trip_vehicle tv "
+        "JOIN vehicle_keys vk ON vk.key = tv.vehicle JOIN trip_dim t ON t.key = tv.trip ORDER BY t_first").fetchall()
+    assert [tuple(r) for r in rows] == [("VT1", at(7, 55), at(7, 55), 1, 1, ""), ("SPARE", at(8, 3), at(8, 3), 2, 2, "")]
+
+
+def test_tracker_state_survives_restart(conn):
+    ingest = Feeder(conn)
+    ingest(trip_update_feed(at(7, 58), {"T1": [(1, at(8, 1), at(8, 1, 30)), (3, at(8, 12), at(8, 12))]}))
+    with conn:
+        ingest.tracker.save(conn)
+    resumed = collector.Tracker.load(conn)
+    assert resumed.visits == ingest.tracker.visits and resumed.runs == ingest.tracker.runs
+    ingest.tracker = resumed
+    ingest(trip_update_feed(at(8, 1, 20), {"T1": [(3, at(8, 13), at(8, 13))]}))
+    ingest.flush(at(9))
+    assert conn.execute("SELECT SUM(n_updates) FROM stop_events").fetchone()[0] == 3
 
 
 def test_events_without_stop_are_dropped(conn):
@@ -281,12 +353,22 @@ def test_poll_skips_repeated_snapshots_and_samples_gps(conn, monkeypatch):
     # the other backend still serves the previous snapshot: nothing is written
     stale = serve(at(8, 0, 58), at(8, 0, 58))
     assert stale["repeated_snapshot"] == ["trip_updates", "vehicles"] and stale["stop_updates"] == 0
-    assert conn.execute("SELECT COUNT(*) FROM vehicle_state").fetchone()[0] == 1
+    assert state.live.execute("SELECT COUNT(*) FROM vehicle_state").fetchone()[0] == 1
     # 10 s later: live state updates, GPS history waits for POSITION_EVERY_S
     nxt = serve(at(8, 1, 10), at(8, 1, 10))
     assert nxt["active"] == 1 and nxt["positions"] == 0
     assert serve(at(8, 1, 31), at(8, 1, 31))["positions"] == 1
-    assert conn.execute("SELECT COUNT(*) FROM vehicle_positions").fetchone()[0] == 2
+    assert list(gps.read(conn)) == []         # buffered until the next commit
+    collector.commit(conn, state)
+    assert conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0] == 1   # keyed by the (frozen) wall clock
+    pings = list(gps.read(conn))
+    assert [(p[0], p[1], p[2], p[3], p[8]) for p in pings] == [
+        ("VT1", at(8, 1), "T1", "R1", "T1"), ("VT1", at(8, 1, 31), "T1", "R1", "T1")]
+    # sealing moves closed days into blocks without changing what is read back
+    with conn:
+        assert history.seal_gps(conn, now=at(8, 1) + 86400) == 2
+    assert list(gps.read(conn)) == pings
+    assert conn.execute("SELECT COUNT(*) FROM gps_recent").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------- schema guard
@@ -310,12 +392,13 @@ def test_server_wont_migrate_but_collector_backs_up_first(tmp_path):
     with pytest.raises(db.SchemaMismatch):
         create_app(str(path))
     assert db.get_meta(c, "schema_version") == "1"
-    assert not list(tmp_path.glob("*.bak"))
+    assert not list(tmp_path.glob("*.bak*"))
 
     db.init(c)  # the collector's path
     assert db.get_meta(c, "schema_version") == str(db.SCHEMA_VERSION)
-    [bak] = tmp_path.glob("t.db.pre-v*.bak")
-    old = db.connect(str(bak), readonly=True)
+    [bak] = tmp_path.glob("t.db.pre-v*.bak.zst")
+    db.restore_backup(str(bak), str(tmp_path / "restored.db"))
+    old = db.connect(str(tmp_path / "restored.db"), readonly=True)
     assert db.get_meta(old, "schema_version") == "1"
     assert old.execute("SELECT COUNT(*) FROM stops").fetchone()[0] == 4
 
@@ -328,3 +411,112 @@ def test_snapshot_cli(conn, tmp_path):
     assert snap.execute("SELECT COUNT(*) FROM stops").fetchone()[0] == 4
     with pytest.raises(SystemExit):
         main(["--db", str(src), "snapshot", str(src)])
+
+
+def test_old_backups_are_pruned(tmp_path):
+    import os
+    for i in range(5):
+        f = tmp_path / f"t.db.pre-v{i}-x.bak{'.zst' if i % 2 else ''}"
+        f.write_bytes(b"x")
+        os.utime(f, (i, i))
+    db.prune_backups(str(tmp_path / "t.db"), keep=2)
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["t.db.pre-v3-x.bak.zst", "t.db.pre-v4-x.bak"]
+
+
+# ---------------------------------------------------------------- compact history
+
+def test_gps_codec_is_lossless():
+    import random
+    import struct
+    f32 = lambda x: struct.unpack("<f", struct.pack("<f", x))[0]
+    rnd = random.Random(1)
+    rows = [(1790000000 + 30 * i, rnd.choice([None, 1, 2]), rnd.choice([None, 3]),
+             f32(40.5 + rnd.random()), f32(-111.9 + rnd.random() / 10),
+             rnd.choice([None, f32(rnd.random() * 360), round(rnd.random() * 360, 2)]),
+             rnd.choice([0.0, f32(rnd.random() * 20), -1.5, None]))
+            for i in range(500)]
+    rows = [(*r[:5], f32(r[5]) if r[5] is not None else None, r[6]) for r in rows]
+    assert gps.decode(gps.encode(rows)) == rows
+    assert gps.decode(gps.encode(rows[:1])) == rows[:1]
+
+
+# v2 tables, as the collector wrote them before schema v3
+V2_TABLES = """
+DROP VIEW IF EXISTS observed_stop_events;
+DROP VIEW IF EXISTS stop_events;
+CREATE TABLE stop_events (
+    service_date TEXT, trip_id TEXT, stop_sequence INTEGER, stop_id TEXT, route_id TEXT,
+    route_short_name TEXT, direction_id INTEGER, trip_headsign TEXT, vehicle_id TEXT,
+    sched_arrival INTEGER, sched_departure INTEGER, obs_arrival INTEGER, obs_departure INTEGER,
+    first_seen INTEGER, last_seen INTEGER, lead_s INTEGER, n_updates INTEGER DEFAULT 1,
+    PRIMARY KEY (service_date, trip_id, stop_sequence)) WITHOUT ROWID;
+CREATE TABLE vehicle_positions (
+    vehicle_id TEXT, ts INTEGER, trip_id TEXT, route_id TEXT, lat REAL, lon REAL, bearing REAL, speed REAL,
+    PRIMARY KEY (vehicle_id, ts)) WITHOUT ROWID;
+"""
+
+
+def test_migration_from_v2_is_lossless(tmp_path):
+    path = tmp_path / "v2.db"
+    c = db.connect(str(path))
+    db.init(c)
+    gtfs_static.import_zip(c, make_zip())
+    c.executescript(V2_TABLES)
+    events = [
+        ("2026-09-21", "T1", 1, "A", "R1", "1", 0, "Downtown", "07001", at(8), at(8), at(8, 1), at(8, 1, 40),
+         at(7, 58), at(8, 1, 20), at(8, 1) - at(8, 1, 20), 2),
+        ("2026-09-21", "T1", 3, "B", "R1", "1", 0, "Downtown", None, at(8, 10), at(8, 10, 30), at(8, 13), at(8, 13),
+         at(7, 58), at(8, 12), 60, 5),                                  # outside the observed window
+        ("2026-09-21", "GONE", 4, None, None, None, None, None, "L9", None, None, at(9), at(9),
+         at(8, 59), at(9), 0, 1),                                       # trip and stop unknown to the GTFS
+        ("2026-09-22", "T4", 1, "A", "R1", "1", 0, "Downtown", "L9", at(49), at(49), at(49, 2), at(49, 2),
+         at(49, 1), at(49, 2), 0, 1),
+    ]
+    c.executemany("INSERT INTO stop_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", events)
+    pings = [("07001", at(8, i), "T1", "R1", 40.75 + i / 1e3, -111.89, 310.45 if i % 2 else None, 12.0477276)
+             for i in range(4)] + [("L9", at(33), None, None, 40.1, -111.8, 0.0, 0.0)]
+    c.executemany("INSERT INTO vehicle_positions VALUES (?,?,?,?,?,?,?,?)", pings)
+    original_pings = set(map(tuple, c.execute("SELECT * FROM vehicle_positions")))
+    db.set_meta(c, "schema_version", "2")
+    c.commit()
+
+    db.init(c)
+    assert db.get_meta(c, "schema_version") == "3"
+    assert list(tmp_path.glob("v2.db.pre-v3-*.bak.zst"))
+    got = [tuple(r) for r in c.execute("SELECT * FROM stop_events ORDER BY service_date, trip_id, stop_sequence")]
+    assert got == sorted(events, key=lambda e: (e[0], e[1], e[2]))
+    assert {p[:8] for p in gps.read(c)} == original_pings
+    assert tuple(c.execute("SELECT (SELECT SUM(n) FROM gps_blocks) IS NULL, COUNT(*) FROM gps_recent").fetchone()) == (1, 5)  # not closed yet
+    assert tuple(c.execute("SELECT block_id, service_id FROM trip_dim WHERE trip_id = 'T1'").fetchone()) == ("", "WK")
+    assert not c.execute("SELECT 1 FROM sqlite_master WHERE name IN ('vehicle_positions') ").fetchone()
+    status = TestClient(create_app(str(path))).get("/api/status").json()["observed"]
+    assert status == {"first": "2026-09-21", "last": "2026-09-22", "n": 3, "trips": 3}
+    seg = analytics.segment(c, "R1", "A", "B")["observed"]
+    assert seg["dur"] == []                                             # B's visit isn't observed
+
+
+def test_status_and_segment_use_compact_history(conn, tmp_path):
+    ingest = Feeder(conn)
+    ingest(trip_update_feed(at(7, 58), {"T1": [(1, at(8, 1), at(8, 1, 30)), (3, at(8, 12), at(8, 12))]}))
+    ingest(trip_update_feed(at(8, 12, 50), {"T1": [(3, at(8, 13), at(8, 13, 5))]}))
+    client = TestClient(create_app(str(tmp_path / "t.db")))
+    ingest._apply([], at(9))                          # final and staged, not merged
+    assert client.get("/api/status").json()["observed"] == {"first": "2026-09-21", "last": "2026-09-21", "n": 1, "trips": 1}
+    with conn:
+        ingest.history.merge_staged()
+    assert client.get("/api/status").json()["observed"] == {"first": "2026-09-21", "last": "2026-09-21", "n": 1, "trips": 1}
+    assert analytics.segment(conn, "R1", "A", "B", date_from="2026-09-22")["observed"]["dur"] == []
+
+
+def test_live_state_is_served_from_the_live_database(conn, tmp_path, monkeypatch):
+    feeds = {collector.TRIP_UPDATE_URL: trip_update_feed(at(8, 1), {"T1": [(3, at(8, 12), at(8, 12))]}),
+             collector.VEHICLE_URL: vehicle_feed(at(8, 1), [("VT1", "T1", at(8, 1), 40.75, -111.89)])}
+    monkeypatch.setattr(collector, "fetch_feed", lambda url: feeds[url])
+    monkeypatch.setattr(collector.time, "time", lambda: at(8, 1, 5))
+    collector.poll_once(conn, collector.StaticLookup(conn))
+    assert db.live_path(str(tmp_path / "t.db")).startswith(str(tmp_path))
+    client = TestClient(create_app(str(tmp_path / "t.db")))
+    [v] = client.get("/api/vehicles/live").json()["vehicles"]
+    assert (v["vehicle_id"], v["route_short_name"], v["next_stop_name"], v["delay_s"]) == ("VT1", "1", "Center St / 9th Ave", 120)
+    status = client.get("/api/status").json()
+    assert status["active_vehicles"] == 1 and status["last_poll"]["n_stop_updates"] == 1
