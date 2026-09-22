@@ -50,8 +50,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         last_ok = c.execute("SELECT ts FROM polls WHERE error IS NULL ORDER BY ts DESC LIMIT 1").fetchone()
         span = c.execute(
             "SELECT MIN(service_date) AS first, MAX(service_date) AS last, COUNT(*) AS n, "
-            "COUNT(DISTINCT service_date || trip_id) AS trips FROM stop_events WHERE lead_s <= ?",
-            (analytics.MAX_LEAD_S,),
+            f"COUNT(DISTINCT service_date || trip_id) AS trips FROM stop_events WHERE {db.OBSERVED}"
         ).fetchone()
         return {
             "gtfs_feed_version": db.get_meta(c, "gtfs_feed_version"),
@@ -113,29 +112,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return analytics.route_performance(conn(), _csv(routes), date_from, date_to, route_type)
 
     @app.get("/api/vehicles/live")
-    def vehicles_live(max_age_s: int = 300):
-        c = conn()
-        latest = c.execute("SELECT MAX(ts) FROM vehicle_positions").fetchone()[0]
-        if latest is None:
-            return {"as_of": None, "vehicles": []}
-        rows = c.execute(
-            """
-            WITH last AS (
-                SELECT vehicle_id, MAX(ts) AS ts FROM vehicle_positions
-                WHERE ts >= ? GROUP BY vehicle_id
-            )
-            SELECT v.vehicle_id, v.ts, v.trip_id, v.route_id, v.lat, v.lon, v.bearing, v.speed,
-                   r.route_short_name, r.route_long_name, r.route_color, r.route_type, t.trip_headsign,
-                   (SELECT obs_arrival - sched_arrival FROM stop_events e
-                     WHERE e.trip_id = v.trip_id AND e.last_seen >= v.ts - 120
-                     ORDER BY e.stop_sequence LIMIT 1) AS delay_s
-            FROM last JOIN vehicle_positions v USING (vehicle_id, ts)
+    def vehicles_live(routes: str | None = Query(None, description="comma-separated route_ids")):
+        """Vehicles currently on a trip, from the collector's latest poll only."""
+        where = ["v.ts >= ?"]
+        params: list = [int(time.time()) - db.LIVE_MAX_AGE_S]
+        route_ids = _csv(routes)
+        if route_ids:
+            where.append(f"v.route_id IN ({','.join('?' * len(route_ids))})")
+            params += route_ids
+        rows = conn().execute(
+            f"""
+            SELECT v.vehicle_id, v.ts, v.trip_id, v.route_id, v.direction_id, v.lat, v.lon,
+                   v.bearing, v.speed, v.delay_s, v.next_stop_id, v.headsign AS trip_headsign,
+                   r.route_short_name, r.route_long_name, r.route_color, r.route_type,
+                   s.stop_name AS next_stop_name
+            FROM vehicle_state v
             LEFT JOIN routes r ON r.route_id = v.route_id
-            LEFT JOIN trips t ON t.trip_id = v.trip_id
+            LEFT JOIN stops s ON s.stop_id = v.next_stop_id
+            WHERE {" AND ".join(where)}
             """,
-            (latest - max_age_s,),
+            params,
         ).fetchall()
-        return {"as_of": latest, "vehicles": [dict(r) for r in rows]}
+        as_of = max((r["ts"] for r in rows), default=None)
+        return {"as_of": as_of, "vehicles": [dict(r) for r in rows]}
 
     class SqlRequest(BaseModel):
         sql: str

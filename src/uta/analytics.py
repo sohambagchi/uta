@@ -5,12 +5,10 @@ import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
 
+from .db import observed
 from .timeutil import local
 
 DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-# A stop visit counts as observed if, at our last sighting, the predicted
-# arrival was no more than this far in the future.
-MAX_LEAD_S = 120
 
 
 # ---------------------------------------------------------------- statistics
@@ -174,7 +172,7 @@ def _pick_pairs(rows, key):
 
 
 def observed_samples(conn, from_ids, to_ids, routes=None, date_from=None, date_to=None) -> list[Sample]:
-    params = list(from_ids) + list(to_ids) + [MAX_LEAD_S, MAX_LEAD_S]
+    params = list(from_ids) + list(to_ids)
     extra = ""
     if routes:
         extra += f" AND a.route_short_name IN ({_in(routes)})"
@@ -196,7 +194,7 @@ def observed_samples(conn, from_ids, to_ids, routes=None, date_from=None, date_t
           ON b.service_date = a.service_date AND b.trip_id = a.trip_id
          AND b.stop_sequence > a.stop_sequence
         WHERE a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)})
-          AND a.lead_s <= ? AND b.lead_s <= ? {extra}
+          AND {observed("a")} AND {observed("b")} {extra}
         """,
         params,
     ).fetchall()
@@ -308,8 +306,8 @@ def travel_time(conn, from_ids, to_ids, *, radius_m=0.0, routes=None, dows=None,
 
 def route_performance(conn, routes=None, date_from=None, date_to=None, route_type=None) -> dict:
     """Schedule adherence (observed - scheduled arrival) per route and hour."""
-    where = ["lead_s <= ?", "sched_arrival IS NOT NULL"]
-    params: list = [MAX_LEAD_S]
+    where = [observed(), "sched_arrival IS NOT NULL"]
+    params: list = []
     if route_type is not None:
         where.append("route_id IN (SELECT route_id FROM routes WHERE route_type = ?)")
         params.append(route_type)

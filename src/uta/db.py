@@ -11,6 +11,29 @@ from pathlib import Path
 
 DEFAULT_DB = os.environ.get("UTA_DB", str(Path.cwd() / "data" / "uta.db"))
 
+# A stop visit counts as observed when, at our last sighting, its predicted
+# arrival was between OBS_LEAD_MIN and OBS_LEAD_MAX seconds from that sighting.
+# Checked against GPS: inside this window the vehicle is a median ~90 m from the
+# stop at the recorded time; outside it the record is a stale or early-dropped
+# prediction. Finalized visits outside the window are deleted by the collector.
+OBS_LEAD_MIN = -120
+OBS_LEAD_MAX = 15
+
+
+def observed(alias: str = "") -> str:
+    """SQL condition selecting observed stop visits, optionally for a table alias."""
+    col = f"{alias}.lead_s" if alias else "lead_s"
+    return f"{col} BETWEEN {OBS_LEAD_MIN} AND {OBS_LEAD_MAX}"
+
+
+OBSERVED = observed()
+# A visit is final once it has been out of the feed this long.
+FINAL_AFTER_S = 600
+# Live views only show vehicles that reported within this window.
+LIVE_MAX_AGE_S = 180
+
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -35,9 +58,31 @@ CREATE TABLE IF NOT EXISTS stops (
     stop_lat       REAL,
     stop_lon       REAL,
     location_type  INTEGER,
-    parent_station TEXT
+    parent_station TEXT,
+    station_id     TEXT         -- derived grouping, see stations
 );
 CREATE INDEX IF NOT EXISTS stops_code ON stops(stop_code);
+
+-- Stops merged into stations: platforms/bays of one hub, and both sides of a
+-- street for the same named stop. Derived at import (gtfs_static.derive).
+CREATE TABLE IF NOT EXISTS stations (
+    station_id TEXT PRIMARY KEY,
+    name       TEXT,
+    lat        REAL,
+    lon        REAL,
+    n_stops    INTEGER
+);
+
+-- Ordered stations along each route direction, merged across trip patterns.
+CREATE TABLE IF NOT EXISTS route_stops (
+    route_id     TEXT,
+    direction_id INTEGER,
+    seq          INTEGER,
+    station_id   TEXT,
+    stop_ids     TEXT,          -- space-separated stop_ids this route uses here
+    n_trips      INTEGER,       -- trips in this direction that serve the station
+    PRIMARY KEY (route_id, direction_id, seq)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS trips (
     trip_id       TEXT PRIMARY KEY,
@@ -114,7 +159,7 @@ CREATE TABLE IF NOT EXISTS stop_events (
     PRIMARY KEY (service_date, trip_id, stop_sequence)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS stop_events_stop ON stop_events(stop_id, service_date);
-CREATE INDEX IF NOT EXISTS stop_events_route ON stop_events(route_id, service_date);
+CREATE INDEX IF NOT EXISTS stop_events_route_stop ON stop_events(route_id, stop_id, service_date);
 
 CREATE TABLE IF NOT EXISTS vehicle_positions (
     vehicle_id TEXT,
@@ -129,6 +174,23 @@ CREATE TABLE IF NOT EXISTS vehicle_positions (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS vehicle_positions_ts ON vehicle_positions(ts);
 
+-- Vehicles in the latest poll that are on a trip and reported recently.
+-- Replaced wholesale on every poll; live views read only this table.
+CREATE TABLE IF NOT EXISTS vehicle_state (
+    vehicle_id   TEXT PRIMARY KEY,
+    ts           INTEGER,       -- vehicle timestamp
+    trip_id      TEXT,
+    route_id     TEXT,
+    direction_id INTEGER,
+    headsign     TEXT,
+    lat          REAL,
+    lon          REAL,
+    bearing      REAL,
+    speed        REAL,          -- m/s
+    delay_s      INTEGER,       -- predicted - scheduled arrival at next stop
+    next_stop_id TEXT
+);
+
 CREATE TABLE IF NOT EXISTS polls (
     ts            INTEGER PRIMARY KEY,   -- wall clock of poll
     feed_ts       INTEGER,
@@ -138,9 +200,16 @@ CREATE TABLE IF NOT EXISTS polls (
     error         TEXT
 );
 
--- ---------- convenience views for ad-hoc SQL ----------
--- Stop visits we consider actually observed (not stale far-future predictions).
-CREATE VIEW IF NOT EXISTS observed_stop_events AS
+"""
+
+# Indexes on migrated columns and views: run after migrate(). Views are always
+# recreated so definition changes apply to existing databases.
+POST_SCHEMA = f"""
+CREATE INDEX IF NOT EXISTS stops_station ON stops(station_id);
+
+-- Stop visits we consider actually observed (see OBSERVED).
+DROP VIEW IF EXISTS observed_stop_events;
+CREATE VIEW observed_stop_events AS
 SELECT e.*,
        s.stop_name,
        obs_arrival - sched_arrival AS delay_s,
@@ -149,9 +218,10 @@ SELECT e.*,
        (CAST(strftime('%w', service_date) AS INTEGER) + 6) % 7 AS dow   -- 0=Mon
 FROM stop_events e
 LEFT JOIN stops s USING (stop_id)
-WHERE lead_s <= 120;
+WHERE {OBSERVED};
 
-CREATE VIEW IF NOT EXISTS scheduled_stop_times AS
+DROP VIEW IF EXISTS scheduled_stop_times;
+CREATE VIEW scheduled_stop_times AS
 SELECT st.trip_id, st.stop_sequence, st.stop_id, s.stop_name,
        t.route_id, r.route_short_name, t.direction_id, t.trip_headsign, t.service_id,
        st.arrival_s, st.departure_s,
@@ -178,7 +248,45 @@ def connect(path: str | None = None, readonly: bool = False) -> sqlite3.Connecti
 
 def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    migrate(conn)
+    conn.executescript(POST_SCHEMA)
     conn.commit()
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to SCHEMA_VERSION."""
+    version = int(get_meta(conn, "schema_version") or 1)
+    if version >= SCHEMA_VERSION:
+        return
+    if version < 2:
+        if "station_id" not in _columns(conn, "stops"):
+            conn.execute("ALTER TABLE stops ADD COLUMN station_id TEXT")
+        conn.execute("DROP INDEX IF EXISTS stop_events_route")
+        purge_stale_events(conn, since=None)
+        if conn.execute("SELECT 1 FROM stops LIMIT 1").fetchone():
+            from . import gtfs_static
+            gtfs_static.derive(conn)
+    set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+    conn.commit()
+
+
+def purge_stale_events(conn: sqlite3.Connection, since: str | None, now: int | None = None) -> int:
+    """Delete finalized stop visits that fall outside the observed window.
+
+    since: only look at service dates >= this (YYYY-MM-DD); None scans everything.
+    """
+    import time
+    cutoff = (now or int(time.time())) - FINAL_AFTER_S
+    where = f"last_seen < ? AND NOT ({OBSERVED})"
+    params: list = [cutoff]
+    if since:
+        where = "service_date >= ? AND " + where
+        params.insert(0, since)
+    return conn.execute(f"DELETE FROM stop_events WHERE {where}", params).rowcount
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

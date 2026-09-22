@@ -67,10 +67,13 @@ SQLite (WAL mode, safe to read while the collector writes). Local time is Americ
 | `stop_events` | one row per trip × stop visit: observed and scheduled arrival/departure (epoch s), route, vehicle, `lead_s` |
 | `observed_stop_events` (view) | `stop_events` filtered to real observations, plus `delay_s`, `hour`, `dow` (0 = Mon), stop name |
 | `vehicle_positions` | GPS pings (vehicle, trip, route, lat/lon, speed m/s, bearing) |
+| `vehicle_state` | vehicles on a trip in the latest poll, with delay and next stop (live views) |
 | `polls` | collector health log |
 | `routes`, `stops`, `trips`, `stop_times`, `shapes` | current static GTFS (`stop_times` in seconds after service-day midnight) |
 | `service_dates` | every date each `service_id` runs (calendar + exceptions expanded) |
 | `stop_routes` | which routes and directions serve each stop |
+| `stations`, `stops.station_id` | stops grouped into stations (bays of a hub, both sides of a street) |
+| `route_stops` | ordered stations along each route direction |
 | `scheduled_stop_times` (view) | `stop_times` joined with trip, route, and stop names |
 
 Example: average observed minutes from stop `5502` to `21929` by route and hour:

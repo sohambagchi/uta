@@ -107,7 +107,7 @@ def test_observed_pipeline(conn):
     # poll 2: at A (departure updated), B prediction updated
     ingest(conn, trip_update_feed(at(8, 1, 20), {"T1": [(1, at(8, 1), at(8, 1, 40)), (3, at(8, 13), at(8, 13))]}))
     # poll 3: A has left the feed; B imminent
-    ingest(conn, trip_update_feed(at(8, 13), {"T1": [(3, at(8, 13, 20), at(8, 13, 30))]}))
+    ingest(conn, trip_update_feed(at(8, 13, 10), {"T1": [(3, at(8, 13, 20), at(8, 13, 30))]}))
 
     rows = {r["stop_sequence"]: r for r in conn.execute("SELECT * FROM stop_events")}
     assert rows[1]["obs_departure"] == at(8, 1, 40)
@@ -115,7 +115,7 @@ def test_observed_pipeline(conn):
     assert rows[1]["stop_id"] == "A" and rows[1]["route_short_name"] == "1"
     assert rows[1]["sched_arrival"] == at(8)
     assert rows[3]["obs_arrival"] == at(8, 13, 20)
-    assert rows[3]["lead_s"] == 20
+    assert rows[3]["lead_s"] == 10
 
     res = analytics.travel_time(conn, ["A"], ["B"])
     obs = res["observed"]["overall"]
@@ -178,3 +178,89 @@ def test_api(conn, tmp_path):
     bad = client.post("/api/sql", json={"sql": "DELETE FROM stops"})
     assert bad.status_code == 400
     assert client.get("/").status_code == 200
+
+
+# ---------------------------------------------------------------- data foundations
+
+def test_stations_group_bays_and_street_sides(conn):
+    assert gtfs_static.normalize_stop_name("1940. W North Temple Station (EB)") == "1940 w n temple station"
+    assert gtfs_static.normalize_stop_name("Riverdale Rd / 4050 S (NB) (Riverda") == "riverdale rd 4050 s"
+    station = dict(conn.execute("SELECT stop_id, station_id FROM stops"))
+    assert station["A"] == station["A2"] == "A"
+    assert station["M"] == "M" and station["B"] == "B"
+    assert tuple(conn.execute("SELECT name, n_stops FROM stations WHERE station_id = 'A'").fetchone()) == ("Main St / 1st Ave", 2)
+
+
+def test_route_stops_merge_patterns(conn):
+    rows = conn.execute(
+        "SELECT station_id, n_trips FROM route_stops WHERE route_id = 'R1' AND direction_id = 0 ORDER BY seq"
+    ).fetchall()
+    # T2/T4 run A->B, T1 also stops at M in between
+    assert [tuple(r) for r in rows] == [("A", 3), ("M", 1), ("B", 3)]
+
+
+def test_observed_window_and_purge(conn):
+    # A left the feed 60 s before its predicted arrival: an early-dropped prediction
+    ingest(conn, trip_update_feed(at(7, 59), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
+    ingest(conn, trip_update_feed(at(8, 9, 50), {"T1": [(3, at(8, 10), at(8, 10))]}))
+    lead = dict(conn.execute("SELECT stop_sequence, lead_s FROM stop_events"))
+    assert lead == {1: 60, 3: 10}
+    assert conn.execute("SELECT COUNT(*) FROM observed_stop_events").fetchone()[0] == 1
+    # not final yet: nothing purged
+    assert db.purge_stale_events(conn, "2026-09-20", now=at(8, 5)) == 0
+    assert db.purge_stale_events(conn, "2026-09-20", now=at(9)) == 1
+    assert [r[0] for r in conn.execute("SELECT stop_sequence FROM stop_events")] == [3]
+
+
+def test_events_without_stop_are_dropped(conn):
+    feed = trip_update_feed(at(8), {"T1": [(9, at(8, 1), at(8, 1))]})   # no such stop_sequence
+    assert list(collector.stop_event_rows(feed, collector.StaticLookup(conn))) == []
+
+
+def vehicle_feed(feed_ts, vehicles):
+    """vehicles: [(vehicle_id, trip_id, ts, lat, lon)]"""
+    msg = rt.FeedMessage()
+    msg.header.gtfs_realtime_version = "2.0"
+    msg.header.timestamp = feed_ts
+    for vid, trip_id, ts, lat, lon in vehicles:
+        ent = msg.entity.add()
+        ent.id = vid
+        ent.vehicle.vehicle.id = vid
+        if trip_id:
+            ent.vehicle.trip.trip_id = trip_id
+        ent.vehicle.timestamp = ts
+        ent.vehicle.position.latitude = lat
+        ent.vehicle.position.longitude = lon
+    return msg
+
+
+def test_vehicle_state_only_active(conn):
+    now = at(8, 2)
+    tu = trip_update_feed(now, {"T1": [(3, at(8, 12), at(8, 12))]})   # 2 min late at B
+    lookup = collector.StaticLookup(conn)
+    events = list(collector.stop_event_rows(tu, lookup))
+    veh = vehicle_feed(now, [
+        ("VT1", "T2", now - 5, 40.75, -111.89),   # names its next trip; TripUpdates says T1
+        ("IDLE", None, now - 5, 40.7, -111.9),    # not on a trip
+        ("GONE", "T3", now - 900, 40.7, -111.9),  # stale report
+    ])
+    rows = list(collector.vehicle_state_rows(veh, tu, events, lookup, now))
+    assert len(rows) == 1
+    vid, _, trip_id, route_id, *_, delay_s, next_stop = rows[0]
+    assert (vid, trip_id, route_id, delay_s, next_stop) == ("VT1", "T1", "R1", 120, "B")
+
+
+def test_migration_from_v1(tmp_path):
+    path = str(tmp_path / "old.db")
+    c = db.connect(path)
+    db.init(c)
+    gtfs_static.import_zip(c, make_zip())
+    # simulate a v1 database: no station column/tables filled, old version marker
+    c.execute("UPDATE stops SET station_id = NULL")
+    c.execute("DELETE FROM route_stops")
+    db.set_meta(c, "schema_version", "1")
+    c.commit()
+    db.init(c)
+    assert c.execute("SELECT COUNT(*) FROM stops WHERE station_id IS NULL").fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM route_stops").fetchone()[0] > 0
+    assert db.get_meta(c, "schema_version") == str(db.SCHEMA_VERSION)

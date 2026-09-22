@@ -10,19 +10,20 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 
 import requests
 from google.transit import gtfs_realtime_pb2 as rt
 
 from . import db, gtfs_static
-from .timeutil import infer_service_date, service_day_origin
+from .timeutil import infer_service_date, local, service_day_origin
 
 log = logging.getLogger(__name__)
 
 VEHICLE_URL = "https://apps.rideuta.com/tms/gtfs/Vehicle"
 TRIP_UPDATE_URL = "https://apps.rideuta.com/tms/gtfs/TripUpdate"
+PURGE_EVERY_S = 300
 
 
 def fetch_feed(url: str) -> rt.FeedMessage:
@@ -43,12 +44,26 @@ class TripInfo:
     stops: dict
 
 
+@dataclass(frozen=True)
+class NextStop:
+    """First upcoming stop of a trip in the current TripUpdates feed."""
+    trip_id: str
+    stop_id: str | None
+    delay_s: int | None
+
+
 class StaticLookup:
     """Cached trip/stop lookups against the static GTFS tables."""
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
         self.trip = lru_cache(maxsize=20000)(self._trip)
+        self.route_short_name = lru_cache(maxsize=2000)(self._route_short_name)
+
+    def _route_short_name(self, route_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT route_short_name FROM routes WHERE route_id = ?", (route_id,)).fetchone()
+        return row[0] if row else None
 
     def _trip(self, trip_id: str) -> TripInfo:
         row = self.conn.execute(
@@ -70,6 +85,7 @@ class StaticLookup:
 
     def clear(self):
         self.trip.cache_clear()
+        self.route_short_name.cache_clear()
 
 
 UPSERT_EVENT = """
@@ -99,6 +115,8 @@ def stop_event_rows(feed: rt.FeedMessage, lookup: StaticLookup):
             continue
         trip_id = tu.trip.trip_id
         info = lookup.trip(trip_id)
+        route_id = info.route_id or tu.trip.route_id or None
+        route_short_name = info.route_short_name or (lookup.route_short_name(route_id) if route_id else None)
         vehicle_id = tu.vehicle.id or None
         seen = tu.timestamp or feed_ts
         explicit_date = (
@@ -118,6 +136,8 @@ def stop_event_rows(feed: rt.FeedMessage, lookup: StaticLookup):
             if static is None and stu.stop_id:
                 static = next((v for v in info.stops.values() if v[0] == stu.stop_id), None)
             stop_id = stu.stop_id or (static[0] if static else None)
+            if stop_id is None:
+                continue
             sched_arr_s = static[1] if static else None
             sched_dep_s = static[2] if static else None
 
@@ -125,12 +145,62 @@ def stop_event_rows(feed: rt.FeedMessage, lookup: StaticLookup):
             origin = service_day_origin(sdate)
             yield (
                 sdate.isoformat(), trip_id, stu.stop_sequence, stop_id,
-                info.route_id, info.route_short_name, info.direction_id, info.headsign,
+                route_id, route_short_name, info.direction_id, info.headsign,
                 vehicle_id,
                 origin + sched_arr_s if sched_arr_s is not None else None,
                 origin + sched_dep_s if sched_dep_s is not None else None,
                 arr, dep, seen, seen, arr - seen,
             )
+
+
+def next_stops(events: list[tuple]) -> dict[str, NextStop]:
+    """trip_id -> its first upcoming stop, from stop_event_rows output."""
+    out: dict[str, tuple] = {}
+    for e in events:
+        trip_id, seq = e[1], e[2]
+        if trip_id not in out or seq < out[trip_id][2]:
+            out[trip_id] = e
+    return {
+        t: NextStop(t, e[3], e[11] - e[9] if e[9] is not None else None)
+        for t, e in out.items()
+    }
+
+
+def vehicle_state_rows(veh_feed: rt.FeedMessage, tu_feed: rt.FeedMessage,
+                       events: list[tuple], lookup: StaticLookup, now: int):
+    """Currently active vehicles: on a trip and reported within LIVE_MAX_AGE_S.
+
+    The vehicle feed sometimes already names the vehicle's next trip in its block
+    while TripUpdates is still predicting the current one, so the TripUpdate's
+    trip wins when both mention the vehicle.
+    """
+    tu_trip = {
+        ent.trip_update.vehicle.id: ent.trip_update.trip.trip_id
+        for ent in tu_feed.entity
+        if ent.HasField("trip_update") and ent.trip_update.vehicle.id
+        and ent.trip_update.trip.schedule_relationship != rt.TripDescriptor.CANCELED
+    }
+    nxt = next_stops(events)
+    feed_ts = veh_feed.header.timestamp or now
+    for ent in veh_feed.entity:
+        if not ent.HasField("vehicle"):
+            continue
+        v = ent.vehicle
+        vehicle_id = v.vehicle.id or ent.id
+        ts = v.timestamp or feed_ts
+        trip_id = tu_trip.get(vehicle_id) or v.trip.trip_id or None
+        if trip_id is None or now - ts > db.LIVE_MAX_AGE_S:
+            continue
+        info = lookup.trip(trip_id)
+        ns = nxt.get(trip_id)
+        yield (
+            vehicle_id, ts, trip_id, info.route_id or v.trip.route_id or None,
+            info.direction_id, info.headsign,
+            v.position.latitude, v.position.longitude,
+            v.position.bearing if v.position.HasField("bearing") else None,
+            v.position.speed if v.position.HasField("speed") else None,
+            ns.delay_s if ns else None, ns.stop_id if ns else None,
+        )
 
 
 def vehicle_rows(feed: rt.FeedMessage, lookup: StaticLookup):
@@ -151,6 +221,7 @@ def vehicle_rows(feed: rt.FeedMessage, lookup: StaticLookup):
 
 def poll_once(conn: sqlite3.Connection, lookup: StaticLookup,
               store_positions: bool = True) -> dict:
+    """Fetch both feeds and store them. Returns counts, or {"error": ...}."""
     started = int(time.time())
     try:
         tu_feed = fetch_feed(TRIP_UPDATE_URL)
@@ -163,8 +234,11 @@ def poll_once(conn: sqlite3.Connection, lookup: StaticLookup,
 
     events = list(stop_event_rows(tu_feed, lookup))
     vehicles = list(vehicle_rows(veh_feed, lookup))
+    live = list(vehicle_state_rows(veh_feed, tu_feed, events, lookup, int(time.time())))
     with conn:
         conn.executemany(UPSERT_EVENT, events)
+        conn.execute("DELETE FROM vehicle_state")
+        conn.executemany("INSERT OR REPLACE INTO vehicle_state VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", live)
         if store_positions:
             conn.executemany(
                 "INSERT OR IGNORE INTO vehicle_positions VALUES (?,?,?,?,?,?,?,?)", vehicles
@@ -173,7 +247,15 @@ def poll_once(conn: sqlite3.Connection, lookup: StaticLookup,
             "INSERT OR REPLACE INTO polls VALUES (?,?,?,?,?,NULL)",
             (started, tu_feed.header.timestamp, len(vehicles), len(tu_feed.entity), len(events)),
         )
-    return {"vehicles": len(vehicles), "trip_updates": len(tu_feed.entity), "stop_updates": len(events)}
+    return {"vehicles": len(vehicles), "active": len(live), "trip_updates": len(tu_feed.entity),
+            "stop_updates": len(events)}
+
+
+def purge(conn: sqlite3.Connection) -> int:
+    """Drop finalized stale visits from the last two service days."""
+    since = (local(int(time.time())).date() - timedelta(days=2)).isoformat()
+    with conn:
+        return db.purge_stale_events(conn, since)
 
 
 def run(db_path: str | None = None, interval: float = 30.0, static_check_hours: float = 6.0,
@@ -181,7 +263,7 @@ def run(db_path: str | None = None, interval: float = 30.0, static_check_hours: 
     conn = db.connect(db_path)
     db.init(conn)
     lookup = StaticLookup(conn)
-    last_static = 0.0
+    last_static = last_purge = 0.0
     while stop_flag is None or not stop_flag.is_set():
         t0 = time.time()
         if t0 - last_static > static_check_hours * 3600:
@@ -195,6 +277,9 @@ def run(db_path: str | None = None, interval: float = 30.0, static_check_hours: 
                     time.sleep(interval)
                     continue
         stats = poll_once(conn, lookup, store_positions=store_positions)
+        if t0 - last_purge > PURGE_EVERY_S:
+            stats["purged"] = purge(conn)
+            last_purge = t0
         log.info("poll: %s (%.1fs)", stats, time.time() - t0)
         wait = max(1.0, interval - (time.time() - t0))
         if stop_flag is not None:
