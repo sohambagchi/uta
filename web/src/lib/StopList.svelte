@@ -10,6 +10,9 @@
   const route = $derived(c.routeId ? store.routeById.get(c.routeId) : undefined);
   const fromIdx = $derived(dir?.stations.findIndex((s) => s.station_id === c.from) ?? -1);
   const toIdx = $derived(dir?.stations.findIndex((s) => s.station_id === c.to) ?? -1);
+  // while choosing a To stop, grey out stops no trip reaches from From
+  const reach = $derived(c.from && !c.to ? store.reachable(c) : null);
+  const onPath = $derived(store.between(c));
   const rows = $derived.by(() => {
     const q = query.trim().toLowerCase();
     return (dir?.stations ?? []).map((s, i) => ({ s, i })).filter(({ s }) => !q || s.name.toLowerCase().includes(q));
@@ -18,7 +21,7 @@
   function role(i: number): "from" | "to" | "between" | null {
     if (i === fromIdx) return "from";
     if (i === toIdx) return "to";
-    if (fromIdx >= 0 && toIdx > fromIdx && i > fromIdx && i < toIdx) return "between";
+    if (onPath.has(i)) return "between";
     return null;
   }
 </script>
@@ -38,12 +41,16 @@
         {dir.stations.length} stops → {dir.headsign ?? ""}
       </h2>
       <input type="search" placeholder="Filter stops…" bind:value={query} aria-label="Filter stops" />
+      {#if reach && reach.size < dir.stations.length - 1}
+        <p class="small muted">Greyed stops aren't served by any trip from {dir.stations[fromIdx]?.name}. Clicking one starts over from it.</p>
+      {/if}
     </div>
     <ol style:--c={slotColor(c.slot)}>
       {#each rows as { s, i } (s.station_id)}
         {@const r = role(i)}
         {@const partial = s.n_trips < dir.max_trips * 0.5}
-        <li class={r} class:hovered={store.hoverStation === s.station_id}>
+        {@const unreachable = reach != null && i !== fromIdx && !reach.has(i)}
+        <li class={r} class:hovered={store.hoverStation === s.station_id} class:unreachable>
           <button onclick={() => store.pickStation(c, s.station_id)}
             onmouseenter={() => (store.hoverStation = s.station_id)}
             onmouseleave={() => (store.hoverStation = null)}
@@ -86,6 +93,8 @@
   li.from .node, li.to .node { background: var(--c); border-color: var(--surface); width: 14px; height: 14px;
     left: -1px; margin-top: -7px; box-shadow: 0 0 0 1px var(--c); }
   li.between .node { border-color: var(--c); }
+  li.unreachable .name { color: var(--muted); }
+  li.unreachable .node { border-color: var(--grid); }
   .name { flex: 1; min-width: 0; padding: 5px 0; font-size: 13px; }
   li.from .name, li.to .name { font-weight: 600; }
   .note { display: block; font-size: 11px; color: var(--muted); }

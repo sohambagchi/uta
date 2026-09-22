@@ -155,6 +155,8 @@ def test_routes_and_detail(conn):
     assert [s["station_id"] for s in d["stations"]] == ["A", "M", "B"]
     assert d["stations"][0]["stop_ids"] == ["A"]
     assert d["max_trips"] == 3 and len(d["shape"]) == 2
+    # T1 runs A-M-B; T2 and T4 run A-B
+    assert d["patterns"] == [{"stations": [0, 2], "n_trips": 2}, {"stations": [0, 1, 2], "n_trips": 1}]
 
 
 def test_simplify():

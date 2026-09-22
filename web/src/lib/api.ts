@@ -29,6 +29,8 @@ export interface RouteDirection {
   headsign: string | null;
   max_trips: number;
   stations: Station[];
+  /** Station sequences trips actually run, as indexes into `stations`. */
+  patterns: { stations: number[]; n_trips: number }[];
   shape: LngLat[];
 }
 export interface RouteDetail {

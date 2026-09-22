@@ -11,6 +11,8 @@
   const INK2 = "var(--ink-2)";
   const SURFACE = "var(--surface)";
   const fmt1 = (m: number) => (Math.abs(m) < 10 ? m.toFixed(1) : Math.round(m).toString());
+  // axis ticks keep a decimal when the step is fractional (fmt1 would print 57.5 as "58" twice)
+  const tick = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
   const signed = (m: number) => (m > 0 ? "+" : m < 0 ? "−" : "") + fmt1(Math.abs(m));
   const name = (s: { letter: string }) => {
     const x = series.find((q) => q.letter === s.letter);
@@ -30,6 +32,11 @@
     ticks: Math.max(2, Math.min(12, Math.round(domain[1] - domain[0]))),
   });
 
+  /** Small dot at every non-gap bin, so a bin isolated between gaps (no line segment) still shows. */
+  function binDots(y: keyof BinPoint & string) {
+    return Plot.dot(binPts.filter((p) => isFinite(p[y] as number)), { x: "x", y, r: 2.5, fill: "color" });
+  }
+
   /** Dot + letter at the last point of each line: selective direct labels. */
   function endLabels<T extends { letter: string; color: string }>(pts: T[], x: keyof T & string, y: keyof T & string) {
     const last = lastPoints(pts, y);
@@ -47,19 +54,22 @@
   const binPts = $derived(bins.flatMap((b) => b.pts));
   const activeSched = $derived(active ? schedBins(active, bin) : []);
   const activeBins = $derived(bins.find((b) => b.s === active)?.pts ?? []);
-  const hourDomain = $derived.by((): [number, number] => {
-    const xs = [...binPts.filter((p) => isFinite(p.median)).map((p) => p.x), ...activeSched.filter((p) => isFinite(p.median)).map((p) => p.x)];
+  const scatter = $derived(series.flatMap((s) => s.trips.map((t) => ({
+    letter: s.letter, color: s.color, x: t.minute / 60, y: t.dur / 60, date: t.date, minute: t.minute,
+  }))));
+  /** Whole hours spanning xs, at least two hours wide. */
+  function hoursSpan(xs: number[]): [number, number] {
     if (!xs.length) return [0, 24];
-    const pad = bin / 120;
-    return [Math.max(0, Math.min(...xs) - pad), Math.min(24, Math.max(...xs) + pad)];
-  });
+    const lo = Math.max(0, Math.floor(Math.min(...xs)));
+    return [lo, Math.min(24, Math.max(lo + 2, Math.ceil(Math.max(...xs))))];
+  }
+  // time-of-day chart also shows the active timetable; the observed-only charts span observed trips
+  const hourDomain = $derived(hoursSpan([...scatter.map((d) => d.x), ...activeSched.filter((p) => isFinite(p.median)).map((p) => p.x)]));
+  const obsDomain = $derived(hoursSpan(scatter.map((d) => d.x)));
   const binCenters = $derived([...new Set([...binPts.map((p) => p.x), ...activeSched.map((p) => p.x)])].sort((a, b) => a - b));
   const dowData = $derived(series.flatMap(dowStats));
   const dailyData = $derived(series.flatMap(daily));
   const dates = $derived([...new Set(dailyData.map((d) => +d.date))].sort((a, b) => a - b));
-  const scatter = $derived(series.flatMap((s) => s.trips.map((t) => ({
-    letter: s.letter, color: s.color, x: t.minute / 60, y: t.dur / 60, date: t.date, minute: t.minute,
-  }))));
 
   function binReadout(field: keyof BinPoint, label: (v: number, p: BinPoint) => string, withSched = false) {
     return (x: number): Readout | null => {
@@ -101,45 +111,51 @@
   };
 
   const hourY = $derived(padDomain([
-    ...binPts.flatMap((p) => [p.median, p.p10, p.p90]), ...activeSched.map((p) => p.median)]));
+    ...scatter.map((d) => d.y), ...binPts.flatMap((p) => [p.median, p.p10, p.p90]), ...activeSched.map((p) => p.median)]));
   const hourPlot = (width: number) => Plot.plot(base(width, 250, {
     x: hourAxis(hourDomain),
-    y: { grid: true, label: null, tickFormat: (v: number) => fmt1(v), domain: hourY, nice: true },
+    y: { grid: true, label: null, tickFormat: tick, domain: hourY, nice: true },
     marks: [
+      // individual trips as faint context, so hours with too few trips for a median still show data
+      Plot.dot(scatter, { x: "x", y: "y", r: 2.5, fill: "color", fillOpacity: 0.4 }),
       Plot.areaY(activeBins, { x: "x", y1: "p10", y2: "p90", fill: active?.color, fillOpacity: 0.1, curve: "monotone-x" }),
       Plot.lineY(activeSched, { x: "x", y: "median", stroke: active?.color, strokeWidth: 1.5, strokeDasharray: "4 3", curve: "monotone-x" }),
       ...bins.map(({ pts }) => Plot.lineY(pts, { x: "x", y: "median", stroke: "color", strokeWidth: 2, curve: "monotone-x" })),
+      binDots("median"),
       ...endLabels(binPts, "x", "median"),
     ],
   })) as never;
 
   const spreadPlot = (width: number) => Plot.plot(base(width, 220, {
-    x: hourAxis(hourDomain),
-    y: { grid: true, label: null, tickFormat: (v: number) => fmt1(v), domain: [0, Math.max(2, ...binPts.map((p) => p.spread).filter(isFinite))], nice: true },
+    x: hourAxis(obsDomain),
+    y: { grid: true, label: null, tickFormat: tick, domain: [0, Math.max(2, ...binPts.map((p) => p.spread).filter(isFinite))], nice: true },
     marks: [
       Plot.ruleY([0], { stroke: "var(--axis)" }),
       ...bins.map(({ pts }) => Plot.lineY(pts, { x: "x", y: "spread", stroke: "color", strokeWidth: 2, curve: "monotone-x" })),
+      binDots("spread"),
       ...endLabels(binPts, "x", "spread"),
     ],
   })) as never;
 
   const vsPlot = (width: number) => Plot.plot(base(width, 220, {
-    x: hourAxis(hourDomain),
-    y: { grid: true, label: null, tickFormat: (v: number) => signed(v) },
+    x: hourAxis(obsDomain),
+    y: { grid: true, label: null, tickFormat: (v: number) => (v > 0 ? "+" : v < 0 ? "−" : "") + tick(Math.abs(v)) },
     marks: [
       Plot.ruleY([0], { stroke: "var(--axis)" }),
       ...bins.map(({ pts }) => Plot.lineY(pts, { x: "x", y: "vsSched", stroke: "color", strokeWidth: 2, curve: "monotone-x" })),
+      binDots("vsSched"),
       ...endLabels(binPts, "x", "vsSched"),
     ],
   })) as never;
 
   const letters = $derived(series.map((s) => s.letter));
   const dowsShown = $derived(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].filter((d) => dowData.some((p) => p.dow === d)));
-  const dowPlot = (width: number) => Plot.plot(base(width, 30 + dowsShown.length * Math.max(24, letters.length * 11 + 8), {
+  const dowLetters = $derived([...new Set(dowData.map((d) => d.letter))]);
+  const dowPlot = (width: number) => Plot.plot(base(width, 40 + dowsShown.length * (dowLetters.length * 14 + 14), {
     marginLeft: 44,
-    x: { grid: true, label: "Minutes", labelAnchor: "right", labelArrow: "none", tickFormat: (v: number) => fmt1(v) },
-    y: { domain: letters, axis: null },
-    fy: { domain: dowsShown, label: null, padding: 0.15 },
+    x: { grid: true, label: "Minutes", labelAnchor: "right", labelArrow: "none", tickFormat: tick },
+    y: { domain: dowLetters, axis: null, inset: 4 },
+    fy: { domain: dowsShown, label: null, padding: 0.1 },
     marks: [
       Plot.ruleY(dowData, { fy: "dow", y: "letter", x1: "p25", x2: "p75", stroke: "color", strokeWidth: 2, strokeOpacity: 0.6 }),
       Plot.dot(dowData, { fy: "dow", y: "letter", x: "median", r: 4, fill: "color", stroke: SURFACE, strokeWidth: 2 }),
@@ -152,7 +168,7 @@
 
   const dailyPlot = (width: number) => Plot.plot(base(width, 220, {
     x: { type: "utc", label: null, ticks: Math.min(dates.length, Math.floor(width / 80)) },
-    y: { grid: true, label: null, tickFormat: (v: number) => fmt1(v), domain: padDomain(dailyData.map((d) => d.median)), nice: true },
+    y: { grid: true, label: null, tickFormat: tick, domain: padDomain(dailyData.map((d) => d.median)), nice: true },
     marks: [
       ...series.map((s) => Plot.lineY(dailyData.filter((d) => d.letter === s.letter),
         { x: "date", y: "median", stroke: "color", strokeWidth: 2, marker: dates.length <= 31 ? "circle-stroke" : null })),
@@ -173,11 +189,12 @@
     };
   };
 
-  const scatterPlot = (width: number) => Plot.plot(base(width, 20 + letters.length * 130, {
+  const scatterLetters = $derived(letters.filter((l) => scatter.some((d) => d.letter === l)));
+  const scatterPlot = (width: number) => Plot.plot(base(width, 40 + scatterLetters.length * 130, {
     marginRight: 40,
-    x: { ...hourAxis([Math.floor(Math.min(...scatter.map((d) => d.x))), Math.ceil(Math.max(...scatter.map((d) => d.x)))]) },
-    y: { grid: true, label: null, tickFormat: (v: number) => fmt1(v), ticks: 4 },
-    fy: { domain: letters, label: null, tickFormat: (l: string) => l },
+    x: hourAxis(obsDomain),
+    y: { grid: true, label: null, tickFormat: tick, ticks: 4, domain: padDomain(scatter.map((d) => d.y)), nice: true },
+    fy: { domain: scatterLetters, label: null, tickFormat: (l: string) => l, padding: 0.15 },
     marks: [
       Plot.dot(scatter, { fy: "letter", x: "x", y: "y", r: 2.5, fill: "color", fillOpacity: 0.7 }),
       Plot.tip(scatter, Plot.pointer({
@@ -202,8 +219,8 @@
   <figure class="card">
     <figcaption>
       <h2>By time of day</h2>
-      <p>Median minutes by departure time. The shaded band is {active?.letter ?? ""}'s p10–p90 range and the dashed line is
-        {active?.letter ?? ""}'s timetable. Bins with fewer than {MIN_PER_BIN} trips are gaps.</p>
+      <p>Faint dots are individual trips; lines are the median per time bin (bins with {MIN_PER_BIN}+ trips). The band is
+        {active?.letter ?? ""}'s p10–p90 range and the dashed line is {active?.letter ?? ""}'s timetable.</p>
     </figcaption>
     <PlotFigure render={hourPlot} readout={binReadout("median", (v, p) => `${fmt1(v)} min · ${p.n} trips`, true)} height={250}
       isEmpty={!binPts.some((p) => isFinite(p.median)) && !activeSched.length} empty="No trips in the selected hours" />
@@ -212,7 +229,8 @@
   <figure class="card">
     <figcaption>
       <h2>Variability by time of day</h2>
-      <p>Spread between the fastest and slowest tenth of trips (p90 − p10), in minutes. Higher means less predictable.</p>
+      <p>Spread between the fastest and slowest tenth of trips (p90 − p10), in minutes, per time bin with {MIN_PER_BIN}+ trips.
+        Higher means less predictable. Wider time bins fill gaps.</p>
     </figcaption>
     <PlotFigure render={spreadPlot} readout={binReadout("spread", (v, p) => `${fmt1(v)} min · ${p.n} trips`)} height={220}
       isEmpty={!binPts.some((p) => isFinite(p.spread))} empty="Not enough observed trips yet" />

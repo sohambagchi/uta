@@ -67,11 +67,14 @@ class Store {
     c.routeId = routeId;
     if (!routeId) { c.from = c.to = null; return; }
     const detail = await this.loadRoute(routeId);
-    // keep the stations if the new route serves both, in some direction, in order
+    // keep the stations if some trip of the new route runs from one to the other
     const dir = detail?.directions.find((d) => {
       const i = d.stations.findIndex((s) => s.station_id === c.from);
       const j = d.stations.findIndex((s) => s.station_id === c.to);
-      return i >= 0 && j > i;
+      return i >= 0 && j >= 0 && d.patterns.some((p) => {
+        const a = p.stations.indexOf(i);
+        return a >= 0 && p.stations.indexOf(j, a + 1) > a;
+      });
     });
     if (dir) c.directionId = dir.direction_id;
     else {
@@ -88,16 +91,41 @@ class Store {
     this.focus(c.id);
   }
 
-  /** List/map click: first pick is From, second (downstream) is To. */
+  /** List/map click: first pick is From, second (a stop some trip reaches from it) is To. */
   pickStation(c: Comparison, stationId: string) {
     const stations = this.direction(c)?.stations ?? [];
-    const idx = (id: string | null) => stations.findIndex((s) => s.station_id === id);
-    const i = idx(stationId);
+    const i = stations.findIndex((s) => s.station_id === stationId);
     if (i < 0) return;
     if (!c.from || c.to) { c.from = stationId; c.to = null; return; }
     if (stationId === c.from) { c.from = null; return; }
-    if (i > idx(c.from)) { c.to = stationId; this.focus(c.id); }
+    if (this.reachable(c).has(i)) { c.to = stationId; this.focus(c.id); }
     else c.from = stationId;
+  }
+
+  /** Indexes of stations strictly between From and To on the busiest pattern that runs between them. */
+  between(c: Comparison | undefined): Set<number> {
+    const dir = this.direction(c);
+    const idx = (id: string | null | undefined) => dir?.stations.findIndex((s) => s.station_id === id) ?? -1;
+    const a = idx(c?.from), b = idx(c?.to);
+    if (!dir || a < 0 || b < 0) return new Set();
+    for (const p of dir.patterns) {   // most trips first
+      const i = p.stations.indexOf(a), j = i >= 0 ? p.stations.indexOf(b, i + 1) : -1;
+      if (j > i) return new Set(p.stations.slice(i + 1, j));
+    }
+    return new Set();
+  }
+
+  /** Indexes of stations that at least one trip visits after the comparison's From station. */
+  reachable(c: Comparison | undefined): Set<number> {
+    const dir = this.direction(c);
+    const out = new Set<number>();
+    const from = dir?.stations.findIndex((s) => s.station_id === c?.from) ?? -1;
+    if (!dir || from < 0) return out;
+    for (const p of dir.patterns) {
+      const k = p.stations.indexOf(from);
+      if (k >= 0) for (const j of p.stations.slice(k + 1)) out.add(j);
+    }
+    return out;
   }
 
   focus(id: number) {

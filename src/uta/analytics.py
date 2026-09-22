@@ -71,9 +71,39 @@ def route_detail(conn: sqlite3.Connection, route_id: str) -> dict | None:
             "headsign": head["trip_headsign"] if head else None,
             "max_trips": max((s["n_trips"] for s in stations), default=0),
             "stations": stations,
+            "patterns": _patterns(conn, route_id, direction_id, stations),
             "shape": _shape(conn, shape_id[0]) if shape_id else [],
         })
     return {"route": dict(route), "directions": directions}
+
+
+def _patterns(conn, route_id: str, direction_id: int, stations: list[dict]) -> list[dict]:
+    """Distinct station sequences trips run, as indexes into `stations`, with trip counts.
+
+    The merged station list can put stations from different trip patterns (a
+    branch, a loop run as separate trips) in one line; the dashboard uses these
+    to only offer destination stops some trip actually reaches.
+    """
+    index = {s["station_id"]: i for i, s in enumerate(stations)}
+    counts: Counter = Counter()
+    cur_trip, seq = None, []
+    for trip_id, station_id in conn.execute(
+        """
+        SELECT st.trip_id, s.station_id FROM stop_times st
+        JOIN trips t USING (trip_id) JOIN stops s USING (stop_id)
+        WHERE t.route_id = ? AND COALESCE(t.direction_id, 0) = ?
+        ORDER BY st.trip_id, st.stop_sequence
+        """, (route_id, direction_id)):
+        if trip_id != cur_trip:
+            if seq:
+                counts[tuple(seq)] += 1
+            cur_trip, seq = trip_id, []
+        i = index.get(station_id)
+        if i is not None and (not seq or seq[-1] != i):
+            seq.append(i)
+    if seq:
+        counts[tuple(seq)] += 1
+    return [{"stations": list(p), "n_trips": n} for p, n in counts.most_common()]
 
 
 def _shape(conn: sqlite3.Connection, shape_id: str) -> list[list[float]]:

@@ -155,13 +155,14 @@
     const dir = store.direction(c);
     const st = dir?.stations ?? [];
     const fi = st.findIndex((s) => s.station_id === c?.from), ti = st.findIndex((s) => s.station_id === c?.to);
+    const onPath = store.between(c);
     const color = c ? seriesColor(c.slot) : "";
     source("stations")?.setData(fc(st.map((s, i) => ({
       type: "Feature",
       properties: {
         id: s.station_id, name: s.name, color,
         end: i === fi || i === ti,
-        between: fi >= 0 && ti > fi && i > fi && i < ti,
+        between: onPath.has(i),
         hover: store.hoverStation === s.station_id,
       },
       geometry: { type: "Point", coordinates: [s.lon, s.lat] },

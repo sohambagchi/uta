@@ -25,7 +25,10 @@
     store.loadRoutes().then(() => (ready = true));
     refreshStatus();
     const t = setInterval(refreshStatus, 30_000);
-    return () => clearInterval(t);
+    // edited URL / back-forward: our own replaceState calls don't fire this
+    const onHash = () => { if (location.hash.replace(/^#/, "") !== store.toHash()) store.fromHash(location.hash); };
+    addEventListener("hashchange", onHash);
+    return () => { clearInterval(t); removeEventListener("hashchange", onHash); };
   });
 
   // fetch segments for complete comparisons
