@@ -34,6 +34,48 @@
     onchange(x, y);
   }
   const pos = (h: number) => ((h - DAY[0]) / (DAY[1] - DAY[0])) * 100;
+  // track position in CSS: thumbs travel inside the track, a half-thumb in from each end
+  const at = (h: number) => `calc(var(--th) / 2 + (100% - var(--th)) * ${pos(h) / 100})`;
+
+  // One track, two thumbs: a press grabs the nearer thumb; when the thumbs touch, the first drag's
+  // direction picks (left moves From, right moves To). Drags move locally; the scope changes on release.
+  let track = $state<HTMLDivElement>()!;
+  let drag: "a" | "b" | "?" | null = null, start = 0;
+  function hourAt(e: PointerEvent) {
+    const r = track.getBoundingClientRect(), th = 22;
+    const f = Math.min(1, Math.max(0, (e.clientX - r.left - th / 2) / (r.width - th)));
+    return DAY[0] + f * (DAY[1] - DAY[0]);
+  }
+  function move(which: "a" | "b", h: number) {
+    h = Math.round(h);
+    if (which === "a") a = Math.max(DAY[0], Math.min(h, b - 1));
+    else b = Math.min(DAY[1], Math.max(h, a + 1));
+  }
+  function down(e: PointerEvent) {
+    const h = hourAt(e);
+    track.setPointerCapture(e.pointerId);
+    if (b - a <= 2 && h > a - 1 && h < b + 1) { drag = "?"; start = h; return; }
+    drag = h <= a ? "a" : h >= b ? "b" : h - a <= b - h ? "a" : "b";
+    move(drag, h);
+  }
+  function pmove(e: PointerEvent) {
+    if (!drag) return;
+    const h = hourAt(e);
+    if (drag === "?") { if (Math.abs(h - start) < 0.4) return; drag = h < start ? "a" : "b"; }
+    move(drag, h);
+  }
+  function up() {
+    if (!drag) return;
+    drag = null;
+    if (a !== h0 || b !== h1) set(a, b);
+  }
+  function key(e: KeyboardEvent, which: "a" | "b") {
+    const d = e.key === "ArrowLeft" || e.key === "ArrowDown" ? -1 : e.key === "ArrowRight" || e.key === "ArrowUp" ? 1 : 0;
+    if (!d) return;
+    e.preventDefault();
+    move(which, (which === "a" ? a : b) + d);
+    set(a, b);
+  }
   const TICKS = [3, 6, 9, 12, 15, 18, 21, 24, 27];
 
   $effect(() => {
@@ -63,17 +105,19 @@
       </div>
       <div class="custom">
         <div class="val"><b>{hourLabel(a)}</b><span class="muted">to</span><b>{hourLabel(b)}</b></div>
-        <div class="track">
+        <div class="track" bind:this={track} onpointerdown={down} onpointermove={pmove}
+          onpointerup={up} onpointercancel={up} role="presentation">
           <div class="rail"></div>
-          <div class="fill" style:left="{pos(a)}%" style:width="{pos(b) - pos(a)}%"></div>
-          <div class="mid" style:left="{pos(24)}%" title="Midnight"></div>
-          <input type="range" min={DAY[0]} max={DAY[1] - 1} step="1" value={a} aria-label="From"
-            oninput={(e) => set(Math.min(+(e.currentTarget as HTMLInputElement).value, b - 1), b)} />
-          <input type="range" min={DAY[0] + 1} max={DAY[1]} step="1" value={b} aria-label="To"
-            oninput={(e) => set(a, Math.max(+(e.currentTarget as HTMLInputElement).value, a + 1))} />
+          <div class="fill" style:left={at(a)} style:right="calc(100% - {at(b)})"></div>
+          <div class="mid" style:left={at(24)} title="Midnight"></div>
+          {#each [["a", a, "From"], ["b", b, "To"]] as [k, v, label] (k)}
+            <div class="thumb" style:left={at(v as number)} role="slider" tabindex="0" aria-label={label as string}
+              aria-valuemin={DAY[0]} aria-valuemax={DAY[1]} aria-valuenow={v as number} aria-valuetext={hourLabel(v as number)}
+              onkeydown={(e) => key(e, k as "a" | "b")}></div>
+          {/each}
         </div>
         <div class="ticks">
-          {#each TICKS as t}<span style:left="{pos(t)}%">{String(t % 24).padStart(2, "0")}</span>{/each}
+          {#each TICKS as t}<span style:left={at(t)}>{String(t % 24).padStart(2, "0")}</span>{/each}
         </div>
         <div class="foot muted">Service day · 03:00 to 03:00 next morning</div>
       </div>
@@ -92,19 +136,15 @@
   .pr { font-family: var(--mono); font-size: 10.5px; opacity: .7; }
   .custom { border-top: 1px solid var(--grid); padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
   .val { display: flex; gap: 8px; align-items: baseline; font-size: 13px; font-family: var(--mono); }
-  .track { position: relative; height: 22px; }
-  .rail, .fill { position: absolute; top: 9px; height: 4px; border-radius: 2px; }
-  .rail { left: 0; right: 0; background: var(--sunk); }
+  .custom { --th: 22px; }
+  .track { position: relative; height: 32px; touch-action: none; cursor: pointer; }
+  .rail, .fill { position: absolute; top: 14px; height: 4px; border-radius: 2px; }
+  .rail { left: calc(var(--th) / 2); right: calc(var(--th) / 2); background: var(--sunk); }
   .fill { background: var(--ink); }
-  .mid { position: absolute; top: 4px; width: 1px; height: 14px; background: var(--axis); }
-  input[type="range"] { position: absolute; inset: 0; width: 100%; margin: 0; background: none; pointer-events: none;
-    appearance: none; -webkit-appearance: none; height: 22px; }
-  input[type="range"]::-webkit-slider-thumb { pointer-events: auto; appearance: none; -webkit-appearance: none; width: 14px; height: 14px;
-    border-radius: 50%; background: var(--panel); border: 2px solid var(--ink); cursor: pointer; }
-  input[type="range"]::-moz-range-thumb { pointer-events: auto; width: 12px; height: 12px; border-radius: 50%; background: var(--panel);
-    border: 2px solid var(--ink); cursor: pointer; }
-  input[type="range"]::-webkit-slider-runnable-track { background: none; }
-  input[type="range"]::-moz-range-track { background: none; }
+  .mid { position: absolute; top: 9px; width: 1px; height: 14px; background: var(--axis); }
+  .thumb { position: absolute; top: 5px; width: var(--th); height: var(--th); margin-left: calc(var(--th) / -2); border-radius: 50%;
+    background: var(--panel); border: 2px solid var(--ink); box-sizing: border-box; }
+  .thumb:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
   .ticks { position: relative; height: 14px; font-size: 10px; color: var(--muted); font-family: var(--mono); }
   .ticks span { position: absolute; transform: translateX(-50%); }
   .foot { font-size: 11px; }
