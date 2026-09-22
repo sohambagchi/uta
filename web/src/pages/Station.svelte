@@ -164,6 +164,8 @@
 
         <Panel q={s.board.length ? `What happened ${clock(s.board[0].obs)}–${clock(lastObs)}?` : "What happened here?"} info="A departure board of the past: scheduled against what happened, on the last day of the range." cap={s.scope.from !== s.scope.to ? dateLabel(s.scope.to) : undefined}>
           {#if s.board.length}
+            <!-- the table scrolls on its own so its scrollbar doesn't sit over the Earlier / Later buttons -->
+            <div class="xs">
             <table class="t">
               <thead><tr><th>Sched</th><th>Arrived</th><th class="r">Δ</th><th>Route</th><th>Trip</th><th class="r">Dwell</th></tr></thead>
               <tbody>
@@ -179,6 +181,7 @@
                 {/each}
               </tbody>
             </table>
+            </div>
           {:else}
             <div class="none"><Tag>no observed arrivals</Tag></div>
           {/if}
@@ -209,6 +212,7 @@
   .rn span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .xh { display: flex; gap: 6px; align-items: center; }
   .sp { flex: 1; }
+  .xs { overflow-x: auto; padding-bottom: 6px; }
   .nav { display: flex; gap: 8px; }
   .none { padding: 20px 0; }
   @media (max-width: 1100px) { .col[style] { width: auto !important; } }
