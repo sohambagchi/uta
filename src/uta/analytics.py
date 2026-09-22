@@ -1,182 +1,216 @@
-"""Query layer: travel times between stops, route performance, stop search."""
+"""Query layer for route segments: trips on one route between two stations.
+
+The dashboard filters and summarizes on the client (hour, weekday, outliers),
+so these functions return per-trip samples in compact columnar form rather
+than pre-aggregated statistics. Only the date range is applied here, since it
+bounds how much data is sent.
+"""
 
 import math
 import sqlite3
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
 
 from .db import observed
 from .timeutil import local
 
-DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+# Observed travel times outside this range are data errors, not trips.
+MAX_TRAVEL_S = 4 * 3600
 
 
-# ---------------------------------------------------------------- statistics
-
-def wstats(values: list[float], weights: list[float] | None = None) -> dict | None:
-    """n, mean, and weighted percentiles. Weights default to 1."""
-    if not values:
-        return None
-    if weights is None:
-        weights = [1.0] * len(values)
-    pairs = sorted(zip(values, weights))
-    total = sum(w for _, w in pairs)
-    mean = sum(v * w for v, w in pairs) / total
-
-    def pct(p: float) -> float:
-        target = p * total
-        acc = 0.0
-        for v, w in pairs:
-            acc += w
-            if acc >= target:
-                return v
-        return pairs[-1][0]
-
-    var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
-    return {
-        "n": len(values),
-        "weight": round(total, 2),
-        "mean": round(mean, 1),
-        "std": round(math.sqrt(var), 1),
-        "min": pairs[0][0],
-        "p10": pct(0.10),
-        "median": pct(0.50),
-        "p90": pct(0.90),
-        "max": pairs[-1][0],
-    }
-
-
-@dataclass
-class Sample:
-    route_id: str
-    route: str          # short name
-    headsign: str
-    hour: int
-    dow: int
-    travel_s: float
-    weight: float = 1.0
-    sched_travel_s: float | None = None
-    date: str | None = None
-    trip_id: str | None = None
-    depart_epoch: int | None = None
-
-
-def group(samples: list[Sample], key) -> dict:
-    buckets: dict = defaultdict(list)
-    for s in samples:
-        buckets[key(s)].append(s)
-    return {
-        k: wstats([s.travel_s for s in v], [s.weight for s in v])
-        for k, v in buckets.items()
-    }
-
-
-def summarize(samples: list[Sample]) -> dict:
-    by_route = group(samples, lambda s: s.route)
-    by_hour = group(samples, lambda s: s.hour)
-    by_dow = group(samples, lambda s: s.dow)
-    by_route_hour = group(samples, lambda s: (s.route, s.hour))
-    by_dow_hour = group(samples, lambda s: (s.dow, s.hour))
-    by_route_dow = group(samples, lambda s: (s.route, s.dow))
-    return {
-        "overall": wstats([s.travel_s for s in samples], [s.weight for s in samples]),
-        "by_route": [{"route": k, **v} for k, v in sorted(by_route.items(), key=lambda kv: kv[1]["mean"])],
-        "by_hour": [{"hour": k, **v} for k, v in sorted(by_hour.items())],
-        "by_dow": [{"dow": k, "dow_name": DOW_NAMES[k], **v} for k, v in sorted(by_dow.items())],
-        "by_route_hour": [{"route": r, "hour": h, **v} for (r, h), v in sorted(by_route_hour.items())],
-        "by_route_dow": [{"route": r, "dow": d, **v} for (r, d), v in sorted(by_route_dow.items())],
-        "by_dow_hour": [{"dow": d, "hour": h, **v} for (d, h), v in sorted(by_dow_hour.items())],
-    }
-
-
-# ---------------------------------------------------------------- stops
-
-def _in(ids: list[str]) -> str:
+def _in(ids) -> str:
     return ",".join("?" * len(ids))
 
 
-def expand_nearby(conn: sqlite3.Connection, stop_ids: list[str], radius_m: float) -> list[str]:
-    """Add stops within radius_m of any given stop (e.g. other platforms / street sides)."""
-    if radius_m <= 0 or not stop_ids:
-        return stop_ids
-    base = conn.execute(
-        f"SELECT stop_lat, stop_lon FROM stops WHERE stop_id IN ({_in(stop_ids)})", stop_ids
+# ---------------------------------------------------------------- routes
+
+def list_routes(conn: sqlite3.Connection) -> list[dict]:
+    dirs = defaultdict(list)
+    for r in conn.execute(
+        """
+        SELECT rs.route_id, rs.direction_id, COUNT(*) AS n_stations,
+               (SELECT trip_headsign FROM trips t WHERE t.route_id = rs.route_id
+                  AND COALESCE(t.direction_id, 0) = rs.direction_id
+                GROUP BY trip_headsign ORDER BY COUNT(*) DESC LIMIT 1) AS headsign
+        FROM route_stops rs GROUP BY rs.route_id, rs.direction_id
+        """
+    ):
+        dirs[r["route_id"]].append(
+            {"direction_id": r["direction_id"], "headsign": r["headsign"], "n_stations": r["n_stations"]})
+    rows = conn.execute(
+        "SELECT route_id, route_short_name, route_long_name, route_type, route_color, route_text_color "
+        "FROM routes ORDER BY route_type, CAST(route_short_name AS INTEGER), route_short_name"
     ).fetchall()
-    out = set(stop_ids)
-    dlat = radius_m / 111_320
-    for lat, lon in base:
-        dlon = radius_m / (111_320 * math.cos(math.radians(lat)))
-        for sid, slat, slon in conn.execute(
-            "SELECT stop_id, stop_lat, stop_lon FROM stops "
-            "WHERE stop_lat BETWEEN ? AND ? AND stop_lon BETWEEN ? AND ?",
-            (lat - dlat, lat + dlat, lon - dlon, lon + dlon),
-        ):
-            if haversine_m(lat, lon, slat, slon) <= radius_m:
-                out.add(sid)
-    return sorted(out)
+    return [{**dict(r), "directions": sorted(dirs.get(r["route_id"], []), key=lambda d: d["direction_id"])}
+            for r in rows]
 
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
-    r = 6_371_000
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+def route_detail(conn: sqlite3.Connection, route_id: str) -> dict | None:
+    route = conn.execute("SELECT * FROM routes WHERE route_id = ?", (route_id,)).fetchone()
+    if route is None:
+        return None
+    directions = []
+    for (direction_id,) in conn.execute(
+            "SELECT DISTINCT direction_id FROM route_stops WHERE route_id = ? ORDER BY direction_id", (route_id,)):
+        stations = [dict(r) for r in conn.execute(
+            """
+            SELECT rs.seq, rs.station_id, st.name, st.lat, st.lon, rs.stop_ids, rs.n_trips
+            FROM route_stops rs JOIN stations st USING (station_id)
+            WHERE rs.route_id = ? AND rs.direction_id = ? ORDER BY rs.seq
+            """, (route_id, direction_id))]
+        for s in stations:
+            s["stop_ids"] = s["stop_ids"].split()
+        head = conn.execute(
+            "SELECT trip_headsign, COUNT(*) AS n FROM trips WHERE route_id = ? AND COALESCE(direction_id, 0) = ? "
+            "GROUP BY trip_headsign ORDER BY n DESC LIMIT 1", (route_id, direction_id)).fetchone()
+        shape_id = conn.execute(
+            "SELECT shape_id FROM trips WHERE route_id = ? AND COALESCE(direction_id, 0) = ? "
+            "AND shape_id IS NOT NULL GROUP BY shape_id ORDER BY COUNT(*) DESC LIMIT 1",
+            (route_id, direction_id)).fetchone()
+        directions.append({
+            "direction_id": direction_id,
+            "headsign": head["trip_headsign"] if head else None,
+            "max_trips": max((s["n_trips"] for s in stations), default=0),
+            "stations": stations,
+            "shape": _shape(conn, shape_id[0]) if shape_id else [],
+        })
+    return {"route": dict(route), "directions": directions}
 
 
-def search_stops(conn: sqlite3.Connection, q: str, downstream_of: list[str] | None = None,
-                 limit: int = 30) -> list[dict]:
-    """Find stops by name / stop code. If downstream_of is given, only stops
-    reachable on a single trip from one of those stops are returned."""
-    q = q.strip()
-    params: list = []
-    where = []
-    if q:
-        terms = q.split()
-        for t in terms:
-            where.append("(s.stop_name LIKE ? OR s.stop_desc LIKE ? OR s.stop_code = ? OR s.stop_id = ?)")
-            params += [f"%{t}%", f"%{t}%", t, t]
-    join = ""
-    if downstream_of:
-        join = f"""JOIN (
-            SELECT DISTINCT b.stop_id FROM stop_times a
-            JOIN stop_times b ON b.trip_id = a.trip_id AND b.stop_sequence > a.stop_sequence
-            WHERE a.stop_id IN ({_in(downstream_of)})
-        ) d ON d.stop_id = s.stop_id"""
-        params = list(downstream_of) + params
-    sql = f"""
-        SELECT s.stop_id, s.stop_code, s.stop_name, s.stop_desc, s.stop_lat, s.stop_lon,
-               (SELECT group_concat(route_short_name, ', ') FROM (
-                    SELECT DISTINCT r.route_short_name FROM stop_routes r
-                    WHERE r.stop_id = s.stop_id ORDER BY r.route_short_name)) AS routes
-        FROM stops s {join}
-        {"WHERE " + " AND ".join(where) if where else ""}
-        ORDER BY s.stop_name
-        LIMIT ?
-    """
-    params.append(limit)
-    return [dict(r) for r in conn.execute(sql, params)]
+def _shape(conn: sqlite3.Connection, shape_id: str) -> list[list[float]]:
+    """Shape as [[lon, lat], ...] (GeoJSON order)."""
+    return [[round(lon, 6), round(lat, 6)] for lat, lon in conn.execute(
+        "SELECT lat, lon FROM shapes WHERE shape_id = ? ORDER BY seq", (shape_id,))]
 
 
-# ---------------------------------------------------------------- travel time
+def network(conn: sqlite3.Connection, tolerance_m: float = 15.0) -> list[dict]:
+    """The most common shape of every route direction, simplified, for map context."""
+    out = []
+    for route_id, direction_id, shape_id, color in conn.execute(
+        """
+        SELECT t.route_id, COALESCE(t.direction_id, 0), t.shape_id, r.route_color
+        FROM trips t JOIN routes r USING (route_id)
+        WHERE t.shape_id IS NOT NULL
+        GROUP BY t.route_id, COALESCE(t.direction_id, 0), t.shape_id
+        HAVING COUNT(*) = (
+            SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM trips t2
+                                WHERE t2.route_id = t.route_id
+                                  AND COALESCE(t2.direction_id, 0) = COALESCE(t.direction_id, 0)
+                                GROUP BY t2.shape_id))
+        """
+    ):
+        out.append({"route_id": route_id, "direction_id": direction_id, "color": color,
+                    "coords": simplify(_shape(conn, shape_id), tolerance_m)})
+    return out
 
-def _pick_pairs(rows, key):
-    """For loop routes a trip may visit A or B twice; keep the tightest A->B pair per trip."""
+
+def simplify(coords: list[list[float]], tolerance_m: float) -> list[list[float]]:
+    """Douglas-Peucker on [lon, lat] points, tolerance in metres (equirectangular)."""
+    if len(coords) < 3:
+        return coords
+    k = math.cos(math.radians(coords[0][1]))
+    pts = [(x * 111_320 * k, y * 111_320) for x, y in coords]
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        (ax, ay), (bx, by) = pts[a], pts[b]
+        dx, dy = bx - ax, by - ay
+        norm = math.hypot(dx, dy) or 1e-9
+        best, idx = 0.0, -1
+        for i in range(a + 1, b):
+            px, py = pts[i]
+            d = abs(dy * (px - ax) - dx * (py - ay)) / norm
+            if d > best:
+                best, idx = d, i
+        if best > tolerance_m:
+            keep[idx] = True
+            stack += [(a, idx), (idx, b)]
+    return [c for c, k_ in zip(coords, keep) if k_]
+
+
+# ---------------------------------------------------------------- segments
+
+def _station(conn, station_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM stations WHERE station_id = ?", (station_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _station_stops(conn, route_id: str, station_id: str) -> list[str]:
+    """Stops of a station that the route uses (any direction)."""
+    ids: set[str] = set()
+    for (stop_ids,) in conn.execute(
+            "SELECT stop_ids FROM route_stops WHERE route_id = ? AND station_id = ?", (route_id, station_id)):
+        ids.update(stop_ids.split())
+    return sorted(ids)
+
+
+def _tightest(rows, key):
+    """A loop trip may visit A or B twice; keep the shortest A->B span per trip."""
     best = {}
     for r in rows:
         k = key(r)
-        span = r["b_seq"] - r["a_seq"]
-        if k not in best or span < best[k]["b_seq"] - best[k]["a_seq"]:
+        if k not in best or r["b_seq"] - r["a_seq"] < best[k]["b_seq"] - best[k]["a_seq"]:
             best[k] = r
-    return best.values()
+    return list(best.values())
 
 
-def observed_samples(conn, from_ids, to_ids, routes=None, date_from=None, date_to=None) -> list[Sample]:
-    params = list(from_ids) + list(to_ids)
+def segment(conn: sqlite3.Connection, route_id: str, from_station: str, to_station: str,
+            date_from: str | None = None, date_to: str | None = None) -> dict | None:
+    """Everything the dashboard needs for one route between two stations."""
+    a, b = _station(conn, from_station), _station(conn, to_station)
+    if a is None or b is None:
+        return None
+    from_ids = _station_stops(conn, route_id, from_station)
+    to_ids = _station_stops(conn, route_id, to_station)
+
+    # directions in which the route reaches `from` before `to`
+    seqs = defaultdict(dict)
+    for direction_id, seq, station_id in conn.execute(
+            "SELECT direction_id, seq, station_id FROM route_stops WHERE route_id = ? AND station_id IN (?, ?)",
+            (route_id, from_station, to_station)):
+        seqs[direction_id][station_id] = seq
+    directions = [d for d, s in seqs.items()
+                  if from_station in s and to_station in s and s[from_station] < s[to_station]]
+    between = []
+    if directions:
+        d = directions[0]
+        between = [dict(r) for r in conn.execute(
+            """
+            SELECT rs.seq, rs.station_id, st.name, st.lat, st.lon, rs.n_trips
+            FROM route_stops rs JOIN stations st USING (station_id)
+            WHERE rs.route_id = ? AND rs.direction_id = ? AND rs.seq BETWEEN ? AND ?
+            ORDER BY rs.seq
+            """, (route_id, d, seqs[d][from_station], seqs[d][to_station]))]
+
+    result = {
+        "route_id": route_id,
+        "from": a, "to": b,
+        "directions": directions,
+        "stations": between,
+        "geometry": [],
+        "observed": _empty_observed(),
+        "scheduled": {"minute": [], "dow": [], "dur": [], "weight": []},
+    }
+    if not from_ids or not to_ids:
+        return result
+    result["observed"] = observed_samples(conn, route_id, from_ids, to_ids, date_from, date_to)
+    sched, shape_trip = scheduled_samples(conn, route_id, from_ids, to_ids)
+    result["scheduled"] = sched
+    if shape_trip:
+        result["geometry"] = segment_geometry(conn, *shape_trip)
+    return result
+
+
+def _empty_observed() -> dict:
+    return {k: [] for k in ("depart", "date", "dow", "minute", "dur", "sched_dur", "dep_delay",
+                            "trip_id", "vehicle_id")}
+
+
+def observed_samples(conn, route_id, from_ids, to_ids, date_from=None, date_to=None) -> dict:
+    """Columnar observed trips A->B, oldest first. minute/dow are local departure time."""
+    params: list = [route_id, *from_ids, *to_ids]
     extra = ""
-    if routes:
-        extra += f" AND a.route_short_name IN ({_in(routes)})"
-        params += routes
     if date_from:
         extra += " AND a.service_date >= ?"
         params.append(date_from)
@@ -185,7 +219,7 @@ def observed_samples(conn, from_ids, to_ids, routes=None, date_from=None, date_t
         params.append(date_to)
     rows = conn.execute(
         f"""
-        SELECT a.service_date, a.trip_id, a.route_id, a.route_short_name, a.trip_headsign,
+        SELECT a.service_date, a.trip_id, a.vehicle_id,
                a.stop_sequence AS a_seq, b.stop_sequence AS b_seq,
                COALESCE(a.obs_departure, a.obs_arrival) AS t0, b.obs_arrival AS t1,
                COALESCE(a.sched_departure, a.sched_arrival) AS s0, b.sched_arrival AS s1
@@ -193,49 +227,46 @@ def observed_samples(conn, from_ids, to_ids, routes=None, date_from=None, date_t
         JOIN stop_events b
           ON b.service_date = a.service_date AND b.trip_id = a.trip_id
          AND b.stop_sequence > a.stop_sequence
-        WHERE a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)})
+        WHERE a.route_id = ? AND a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)})
           AND {observed("a")} AND {observed("b")} {extra}
         """,
         params,
     ).fetchall()
-    out = []
-    for r in _pick_pairs(rows, lambda r: (r["service_date"], r["trip_id"])):
-        travel = r["t1"] - r["t0"]
-        if travel <= 0 or travel > 4 * 3600:
+    out = _empty_observed()
+    for r in sorted(_tightest(rows, lambda r: (r["service_date"], r["trip_id"])), key=lambda r: r["t0"]):
+        dur = r["t1"] - r["t0"]
+        if not 0 < dur <= MAX_TRAVEL_S:
             continue
         dt = local(r["t0"])
-        out.append(Sample(
-            route_id=r["route_id"], route=r["route_short_name"] or r["route_id"] or "?",
-            headsign=r["trip_headsign"] or "", hour=dt.hour, dow=dt.weekday(),
-            travel_s=travel,
-            sched_travel_s=(r["s1"] - r["s0"]) if r["s0"] and r["s1"] else None,
-            date=r["service_date"], trip_id=r["trip_id"], depart_epoch=r["t0"],
-        ))
+        out["depart"].append(r["t0"])
+        out["date"].append(r["service_date"])
+        out["dow"].append(dt.weekday())
+        out["minute"].append(dt.hour * 60 + dt.minute)
+        out["dur"].append(dur)
+        out["sched_dur"].append(r["s1"] - r["s0"] if r["s0"] is not None and r["s1"] is not None else None)
+        out["dep_delay"].append(r["t0"] - r["s0"] if r["s0"] is not None else None)
+        out["trip_id"].append(r["trip_id"])
+        out["vehicle_id"].append(r["vehicle_id"])
     return out
 
 
-def scheduled_samples(conn, from_ids, to_ids, routes=None) -> list[Sample]:
-    """One sample per (trip, weekday), weighted by how many dates in the current
-    feed that trip runs on that weekday."""
-    params = list(from_ids) + list(to_ids)
-    extra = ""
-    if routes:
-        extra = f" AND r.route_short_name IN ({_in(routes)})"
-        params += routes
+def scheduled_samples(conn, route_id, from_ids, to_ids) -> tuple[dict, tuple | None]:
+    """Timetabled trips A->B in the current feed, one row per (trip, weekday) it runs,
+    weighted by the number of dates. Also returns (trip_id, a_seq, b_seq) of a trip
+    on the most common shape, for drawing the segment."""
     rows = conn.execute(
         f"""
-        SELECT a.trip_id, t.route_id, r.route_short_name, t.trip_headsign, t.service_id,
+        SELECT a.trip_id, t.service_id, t.shape_id,
                a.stop_sequence AS a_seq, b.stop_sequence AS b_seq,
                a.departure_s AS t0, b.arrival_s AS t1
         FROM stop_times a
         JOIN stop_times b ON b.trip_id = a.trip_id AND b.stop_sequence > a.stop_sequence
         JOIN trips t ON t.trip_id = a.trip_id
-        JOIN routes r ON r.route_id = t.route_id
-        WHERE a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)}) {extra}
+        WHERE t.route_id = ? AND a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)})
         """,
-        params,
+        [route_id, *from_ids, *to_ids],
     ).fetchall()
-    pairs = list(_pick_pairs(rows, lambda r: r["trip_id"]))
+    pairs = [r for r in _tightest(rows, lambda r: r["trip_id"]) if r["t0"] is not None and r["t1"] is not None]
     service_ids = sorted({r["service_id"] for r in pairs})
     dow_counts: dict = defaultdict(dict)
     if service_ids:
@@ -245,102 +276,46 @@ def scheduled_samples(conn, from_ids, to_ids, routes=None) -> list[Sample]:
             service_ids,
         ):
             dow_counts[sid][dow] = n
-    out = []
+    out = {"minute": [], "dow": [], "dur": [], "weight": []}
     for r in pairs:
-        if r["t0"] is None or r["t1"] is None:
-            continue
-        travel = r["t1"] - r["t0"]
         days_over = r["t0"] // 86400
-        for dow, n in dow_counts.get(r["service_id"], {}).items():
-            out.append(Sample(
-                route_id=r["route_id"], route=r["route_short_name"] or r["route_id"],
-                headsign=r["trip_headsign"] or "", hour=(r["t0"] // 3600) % 24,
-                dow=(dow + days_over) % 7, travel_s=travel, weight=n, trip_id=r["trip_id"],
-            ))
-    return out
+        for dow, n in sorted(dow_counts.get(r["service_id"], {}).items()):
+            out["minute"].append((r["t0"] // 60) % 1440)
+            out["dow"].append((dow + days_over) % 7)
+            out["dur"].append(r["t1"] - r["t0"])
+            out["weight"].append(n)
+    shape_trip = None
+    shapes = Counter(r["shape_id"] for r in pairs if r["shape_id"])
+    if shapes:
+        top = shapes.most_common(1)[0][0]
+        r = next(r for r in pairs if r["shape_id"] == top)
+        shape_trip = (r["trip_id"], r["a_seq"], r["b_seq"])
+    return out, shape_trip
 
 
-def _filter(samples: list[Sample], dows=None, hour_from=None, hour_to=None) -> list[Sample]:
-    out = samples
-    if dows:
-        out = [s for s in out if s.dow in dows]
-    if hour_from is not None:
-        out = [s for s in out if s.hour >= hour_from]
-    if hour_to is not None:
-        out = [s for s in out if s.hour <= hour_to]
-    return out
+def segment_geometry(conn, trip_id: str, a_seq: int, b_seq: int) -> list[list[float]]:
+    """The part of the trip's shape between two of its stops, as [[lon, lat], ...]."""
+    row = conn.execute("SELECT shape_id FROM trips WHERE trip_id = ?", (trip_id,)).fetchone()
+    ends = conn.execute(
+        "SELECT s.stop_lat, s.stop_lon FROM stop_times st JOIN stops s USING (stop_id) "
+        "WHERE st.trip_id = ? AND st.stop_sequence IN (?, ?) ORDER BY st.stop_sequence",
+        (trip_id, a_seq, b_seq)).fetchall()
+    if row is None or row[0] is None or len(ends) != 2:
+        return [[lon, lat] for lat, lon in ends]
+    shape = _shape(conn, row[0])
+    if not shape:
+        return [[lon, lat] for lat, lon in ends]
+    k = math.cos(math.radians(ends[0][0]))
 
+    def nearest(lat, lon, start):
+        best, idx = float("inf"), start
+        for i in range(start, len(shape)):
+            x, y = shape[i]
+            d = ((x - lon) * k) ** 2 + (y - lat) ** 2
+            if d < best:
+                best, idx = d, i
+        return idx
 
-def travel_time(conn, from_ids, to_ids, *, radius_m=0.0, routes=None, dows=None,
-                hour_from=None, hour_to=None, date_from=None, date_to=None) -> dict:
-    from_ids = expand_nearby(conn, list(from_ids), radius_m)
-    to_ids = expand_nearby(conn, list(to_ids), radius_m)
-
-    obs = _filter(observed_samples(conn, from_ids, to_ids, routes, date_from, date_to),
-                  dows, hour_from, hour_to)
-    sch = _filter(scheduled_samples(conn, from_ids, to_ids, routes), dows, hour_from, hour_to)
-
-    with_sched = [s for s in obs if s.sched_travel_s]
-    adherence = wstats([s.travel_s - s.sched_travel_s for s in with_sched])
-
-    recent = sorted(obs, key=lambda s: s.depart_epoch or 0, reverse=True)[:100]
-    names = {r["stop_id"]: r["stop_name"] for r in conn.execute(
-        f"SELECT stop_id, stop_name FROM stops WHERE stop_id IN ({_in(from_ids + to_ids)})",
-        from_ids + to_ids)}
-    return {
-        "from": [{"stop_id": s, "stop_name": names.get(s)} for s in from_ids],
-        "to": [{"stop_id": s, "stop_name": names.get(s)} for s in to_ids],
-        "observed": summarize(obs),
-        "scheduled": summarize(sch),
-        "observed_minus_scheduled": adherence,
-        "recent_trips": [
-            {"date": s.date, "trip_id": s.trip_id, "route": s.route, "headsign": s.headsign,
-             "depart": local(s.depart_epoch).strftime("%Y-%m-%d %H:%M"),
-             "travel_s": s.travel_s, "sched_travel_s": s.sched_travel_s}
-            for s in recent
-        ],
-    }
-
-
-# ---------------------------------------------------------------- routes
-
-def route_performance(conn, routes=None, date_from=None, date_to=None, route_type=None) -> dict:
-    """Schedule adherence (observed - scheduled arrival) per route and hour."""
-    where = [observed(), "sched_arrival IS NOT NULL"]
-    params: list = []
-    if route_type is not None:
-        where.append("route_id IN (SELECT route_id FROM routes WHERE route_type = ?)")
-        params.append(route_type)
-    if routes:
-        where.append(f"route_short_name IN ({_in(routes)})")
-        params += routes
-    if date_from:
-        where.append("service_date >= ?")
-        params.append(date_from)
-    if date_to:
-        where.append("service_date <= ?")
-        params.append(date_to)
-    w = " AND ".join(where)
-    common = """
-        COUNT(*) AS n,
-        ROUND(AVG(obs_arrival - sched_arrival), 1) AS mean_delay_s,
-        ROUND(100.0 * SUM(obs_arrival - sched_arrival BETWEEN -60 AND 300) / COUNT(*), 1) AS pct_on_time,
-        ROUND(100.0 * SUM(obs_arrival - sched_arrival > 300) / COUNT(*), 1) AS pct_late,
-        ROUND(100.0 * SUM(obs_arrival - sched_arrival < -60) / COUNT(*), 1) AS pct_early,
-        COUNT(DISTINCT service_date || trip_id) AS trips
-    """
-    by_route = conn.execute(
-        f"SELECT route_short_name AS route, {common} FROM stop_events WHERE {w} "
-        f"GROUP BY route_short_name ORDER BY mean_delay_s DESC", params).fetchall()
-    by_hour = conn.execute(
-        f"SELECT CAST(strftime('%H', obs_arrival, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
-        f"{common} FROM stop_events WHERE {w} GROUP BY hour ORDER BY hour", params).fetchall()
-    by_route_hour = conn.execute(
-        f"SELECT route_short_name AS route, "
-        f"CAST(strftime('%H', obs_arrival, 'unixepoch', 'localtime') AS INTEGER) AS hour, "
-        f"{common} FROM stop_events WHERE {w} GROUP BY route, hour", params).fetchall()
-    return {
-        "by_route": [dict(r) for r in by_route],
-        "by_hour": [dict(r) for r in by_hour],
-        "by_route_hour": [dict(r) for r in by_route_hour],
-    }
+    i = nearest(ends[0][0], ends[0][1], 0)
+    j = nearest(ends[1][0], ends[1][1], i)
+    return [[ends[0][1], ends[0][0]], *shape[i:j + 1], [ends[1][1], ends[1][0]]]

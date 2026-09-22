@@ -3,3 +3,5 @@ result
 __pycache__/
 *.egg-info/
 .pytest_cache/
+node_modules/
+src/uta/static/

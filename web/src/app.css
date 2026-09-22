@@ -1,0 +1,94 @@
+/* Tokens follow the dataviz reference palette; dark values are their own steps. */
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --accent: #2a78d6;
+  /* comparison slots = categorical slots 1-4, fixed order */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  /* status: reserved for vehicle delay, always shown with a label */
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --no-data: #898781;
+  --delta-up: #b02a2a;
+  --delta-down: #006300;
+  --radius: 10px;
+  --sidebar-w: 380px;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --ink: #ffffff; --ink-2: #c3c2b7;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --accent: #3987e5;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --delta-up: #e66767; --delta-down: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321; --ink: #ffffff; --ink-2: #c3c2b7;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --accent: #3987e5;
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+  --delta-up: #e66767; --delta-down: #0ca30c;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--page); color: var(--ink); font-size: 14px; line-height: 1.45; }
+h1, h2, h3 { margin: 0; font-weight: 600; }
+h1 { font-size: 16px; }
+h2 { font-size: 14px; }
+h3 { font-size: 13px; }
+p { margin: 0; }
+button, select, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+select, input[type="text"], input[type="search"] {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+[hidden] { display: none !important; }
+
+.chip {
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+  border-radius: 999px; padding: 2px 10px; font-size: 12px;
+}
+.chip[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.chip.preset { border-style: dashed; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: var(--surface); color: var(--ink-2); padding: 3px 10px; font-size: 12px; }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); font-weight: 600; }
+.icon-btn { border: 0; background: none; color: var(--muted); border-radius: 6px; padding: 2px 6px; line-height: 1; }
+.icon-btn:hover { background: var(--surface-2); color: var(--ink); }
+.key { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; }
+.route-badge { display: inline-block; min-width: 30px; text-align: center; border-radius: 5px; padding: 0 6px;
+  font-weight: 600; font-size: 12px; line-height: 20px; }
+
+/* Observable Plot chrome */
+.plot-figure svg { overflow: visible; }
+.plot-figure [aria-label$="-grid"] line { stroke: var(--grid); stroke-opacity: 1; }
+.plot-figure [aria-label$="-axis tick"] { stroke: var(--axis); }
+.plot-figure text { fill: var(--muted); font-variant-numeric: tabular-nums; }
+.plot-figure [aria-label="text"] text, .plot-figure .label text { fill: var(--ink-2); }
+
+/* MapLibre popups in theme colors */
+.maplibregl-popup-content { background: var(--surface); color: var(--ink); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.18); font: 13px system-ui, sans-serif; padding: 10px 12px; }
+.maplibregl-popup-tip { border-top-color: var(--surface) !important; border-bottom-color: var(--surface) !important; }
+.maplibregl-popup-close-button { color: var(--muted); }

@@ -117,66 +117,63 @@ def test_observed_pipeline(conn):
     assert rows[3]["obs_arrival"] == at(8, 13, 20)
     assert rows[3]["lead_s"] == 10
 
-    res = analytics.travel_time(conn, ["A"], ["B"])
-    obs = res["observed"]["overall"]
-    assert obs["n"] == 1
-    assert obs["median"] == at(8, 13, 20) - at(8, 1, 40)  # 700 s
-    assert res["observed_minus_scheduled"]["median"] == 700 - 600
-    assert res["observed"]["by_hour"][0]["hour"] == 8
-    assert res["observed"]["by_dow"][0]["dow"] == 0
+    seg = analytics.segment(conn, "R1", "A", "B")
+    obs = seg["observed"]
+    assert obs["dur"] == [at(8, 13, 20) - at(8, 1, 40)]  # 700 s
+    assert obs["sched_dur"] == [600]
+    assert obs["dep_delay"] == [100]
+    assert obs["minute"] == [8 * 60 + 1] and obs["dow"] == [0] and obs["date"] == ["2026-09-21"]
 
 
 def test_stale_predictions_are_not_observed(conn):
     # only ever saw a far-future prediction for B (e.g. trip dropped from feed)
     ingest(conn, trip_update_feed(at(7, 0), {"T1": [(1, at(8, 0), at(8, 0)), (3, at(8, 10), at(8, 10))]}))
-    assert analytics.travel_time(conn, ["A"], ["B"])["observed"]["overall"] is None
+    assert analytics.segment(conn, "R1", "A", "B")["observed"]["dur"] == []
 
 
-def test_scheduled_by_route_and_dow(conn):
-    res = analytics.travel_time(conn, ["A"], ["B"])
-    sch = res["scheduled"]
-    by_route = {r["route"]: r for r in sch["by_route"]}
-    assert by_route["1"]["median"] == 600
-    assert by_route["2"]["median"] == 1200
-    by_dow = {r["dow"]: r for r in sch["by_dow"]}
-    # weekday: T1, T2 (10 min) and T3 (20 min) on Mon-Thu
-    assert by_dow[0]["weight"] == 3
-    assert 4 not in by_dow  # Friday removed by calendar_dates
-    # T4 is Saturday service at 25:00 -> departs 1am Sunday
-    assert by_dow[6]["n"] == 1 and by_dow[6]["median"] == 600
-    hours = {r["hour"] for r in sch["by_hour"]}
-    assert hours == {1, 8, 17}
-
-    # filters
-    only_r2 = analytics.travel_time(conn, ["A"], ["B"], routes=["2"])["scheduled"]["overall"]
-    assert only_r2["median"] == 1200
-    peak = analytics.travel_time(conn, ["A"], ["B"], hour_from=17, hour_to=18)["scheduled"]["overall"]
-    assert peak["n"] == 4 and peak["median"] == 600
+def test_segment_scheduled_and_shape(conn):
+    seg = analytics.segment(conn, "R1", "A", "B")
+    sch = seg["scheduled"]
+    rows = sorted(zip(sch["minute"], sch["dow"], sch["dur"], sch["weight"]))
+    # T1 (8:00) and T2 (17:00) Mon-Thu; T4 Saturday 25:00 -> Sunday 1am
+    assert (60, 6, 600, 1) in rows
+    assert [r for r in rows if r[0] == 480] == [(480, d, 600, 1) for d in range(4)]
+    assert all(r[1] != 4 for r in rows)  # Friday removed by calendar_dates
+    assert seg["directions"] == [0]
+    assert [s["station_id"] for s in seg["stations"]] == ["A", "M", "B"]
+    assert seg["geometry"][0] == [-111.89, 40.76] and seg["geometry"][-1] == [-111.89, 40.74]
+    # route 2 never stops at M
+    assert analytics.segment(conn, "R2", "A", "M")["scheduled"]["dur"] == []
+    # reversed: no direction reaches B before A
+    assert analytics.segment(conn, "R1", "B", "A")["directions"] == []
 
 
-def test_nearby_expansion(conn):
-    assert analytics.expand_nearby(conn, ["A"], 50) == ["A", "A2"]
-    assert analytics.expand_nearby(conn, ["A"], 0) == ["A"]
+def test_routes_and_detail(conn):
+    routes = {r["route_id"]: r for r in analytics.list_routes(conn)}
+    assert routes["R1"]["directions"] == [{"direction_id": 0, "headsign": "Downtown", "n_stations": 3}]
+    d = analytics.route_detail(conn, "R1")["directions"][0]
+    assert [s["station_id"] for s in d["stations"]] == ["A", "M", "B"]
+    assert d["stations"][0]["stop_ids"] == ["A"]
+    assert d["max_trips"] == 3 and len(d["shape"]) == 2
 
 
-def test_stop_search(conn):
-    names = [s["stop_id"] for s in analytics.search_stops(conn, "main 1st")]
-    assert names == ["A", "A2"]
-    downstream = [s["stop_id"] for s in analytics.search_stops(conn, "", downstream_of=["A"])]
-    assert set(downstream) == {"M", "B"}
+def test_simplify():
+    line = [[0, 0], [0.00001, 0.0005], [0, 0.001]]   # ~1 m off a straight line
+    assert analytics.simplify(line, 5) == [[0, 0], [0, 0.001]]
+    assert len(analytics.simplify(line, 0.1)) == 3
 
 
 def test_api(conn, tmp_path):
     client = TestClient(create_app(str(tmp_path / "t.db")))
     assert client.get("/api/status").json()["gtfs_feed_version"] == "TEST1"
-    r = client.get("/api/travel-time", params={"from": "A", "to": "B"}).json()
-    assert r["scheduled"]["overall"]["n"] > 0
-    assert client.get("/api/route-performance", params={"route_type": 3}).status_code == 200
-    q = client.post("/api/sql", json={"sql": "SELECT COUNT(*) AS n FROM stops"}).json()
-    assert q["rows"] == [[4]]
-    # the SQL console is read-only
-    bad = client.post("/api/sql", json={"sql": "DELETE FROM stops"})
-    assert bad.status_code == 400
+    assert len(client.get("/api/routes").json()) == 2
+    assert client.get("/api/routes/R1").status_code == 200
+    assert client.get("/api/routes/nope").status_code == 404
+    seg = client.get("/api/segment", params={"route_id": "R1", "from": "A", "to": "B"}).json()
+    assert len(seg["scheduled"]["dur"]) > 0
+    assert client.get("/api/segment", params={"route_id": "R1", "from": "X", "to": "B"}).status_code == 404
+    assert len(client.get("/api/network").json()) == 2
+    assert client.get("/api/vehicles/live").json() == {"as_of": None, "vehicles": []}
     assert client.get("/").status_code == 200
 
 

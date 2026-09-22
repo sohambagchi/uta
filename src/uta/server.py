@@ -1,4 +1,4 @@
-"""FastAPI app: JSON API + static dashboard."""
+"""FastAPI app: JSON API + the built dashboard (web/ -> static/)."""
 
 import sqlite3
 import threading
@@ -6,15 +6,18 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 from . import analytics, db
 
 STATIC_DIR = Path(__file__).parent / "static"
-SQL_ROW_LIMIT = 5000
-SQL_TIMEOUT_S = 15
+
+NOT_BUILT = """<!doctype html><title>UTA Transit Explorer</title>
+<body style="font:14px system-ui;padding:40px">
+<p>The dashboard hasn't been built. Run <code>npm --prefix web run build</code> in the dev shell,
+or use <code>npm --prefix web run dev</code> for a live-reloading dev server.</p>
+<p>The API is up: <a href="/docs">/docs</a>.</p>"""
 
 
 def _csv(v: str | None) -> list[str] | None:
@@ -23,14 +26,10 @@ def _csv(v: str | None) -> list[str] | None:
     return [x.strip() for x in v.split(",") if x.strip()]
 
 
-def _ints(v: str | None) -> list[int] | None:
-    items = _csv(v)
-    return [int(x) for x in items] if items else None
-
-
 def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(title="UTA Transit Explorer")
     local = threading.local()
+    network_cache: dict = {}
 
     def conn() -> sqlite3.Connection:
         # one connection per worker thread; FastAPI runs sync endpoints in a pool
@@ -55,61 +54,49 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return {
             "gtfs_feed_version": db.get_meta(c, "gtfs_feed_version"),
             "gtfs_imported_at": db.get_meta(c, "gtfs_imported_at"),
-            "counts": {
-                t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                for t in ("routes", "stops", "trips", "polls")
-            },
             "observed": dict(span),
-            "vehicle_positions": c.execute("SELECT COUNT(*) FROM vehicle_positions").fetchone()[0],
+            "active_vehicles": c.execute(
+                "SELECT COUNT(*) FROM vehicle_state WHERE ts >= ?",
+                (int(time.time()) - db.LIVE_MAX_AGE_S,)).fetchone()[0],
             "last_poll": dict(last) if last else None,
             "last_ok_poll_age_s": int(time.time() - last_ok[0]) if last_ok else None,
         }
 
     @app.get("/api/routes")
     def routes():
-        rows = conn().execute(
-            "SELECT route_id, route_short_name, route_long_name, route_type, route_color, route_text_color "
-            "FROM routes ORDER BY route_type, CAST(route_short_name AS INTEGER), route_short_name"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        """All routes with their directions (headsign, number of stations)."""
+        return analytics.list_routes(conn())
 
-    @app.get("/api/routes/{route_id}/shapes")
-    def route_shapes(route_id: str):
+    @app.get("/api/routes/{route_id}")
+    def route(route_id: str):
+        """Ordered stations and main shape for each direction of a route."""
+        detail = analytics.route_detail(conn(), route_id)
+        if detail is None:
+            raise HTTPException(404, "unknown route")
+        return detail
+
+    @app.get("/api/network")
+    def network():
+        """Simplified main shape of every route direction (map context)."""
         c = conn()
-        shape_ids = [r[0] for r in c.execute(
-            "SELECT DISTINCT shape_id FROM trips WHERE route_id = ?", (route_id,))]
-        return {
-            sid: [[r[0], r[1]] for r in c.execute(
-                "SELECT lat, lon FROM shapes WHERE shape_id = ? ORDER BY seq", (sid,))]
-            for sid in shape_ids
-        }
+        version = db.get_meta(c, "gtfs_feed_version")
+        if network_cache.get("version") != version:
+            network_cache.update(version=version, data=analytics.network(c))
+        return network_cache["data"]
 
-    @app.get("/api/stops")
-    def stops(q: str = "", downstream_of: str | None = None, limit: int = 30):
-        return analytics.search_stops(conn(), q, _csv(downstream_of), limit=min(limit, 200))
-
-    @app.get("/api/travel-time")
-    def travel_time(
-        from_: str = Query(..., alias="from", description="comma-separated stop_ids"),
-        to: str = Query(..., description="comma-separated stop_ids"),
-        radius_m: float = 0,
-        routes: str | None = None,
-        dows: str | None = Query(None, description="0=Mon..6=Sun, comma-separated"),
-        hour_from: int | None = None,
-        hour_to: int | None = None,
-        date_from: str | None = None,
+    @app.get("/api/segment")
+    def segment(
+        route_id: str,
+        from_: str = Query(..., alias="from", description="station_id"),
+        to: str = Query(..., description="station_id"),
+        date_from: str | None = Query(None, description="YYYY-MM-DD, service date"),
         date_to: str | None = None,
     ):
-        return analytics.travel_time(
-            conn(), _csv(from_), _csv(to), radius_m=min(radius_m, 1000), routes=_csv(routes),
-            dows=_ints(dows), hour_from=hour_from, hour_to=hour_to,
-            date_from=date_from, date_to=date_to,
-        )
-
-    @app.get("/api/route-performance")
-    def route_performance(routes: str | None = None, date_from: str | None = None,
-                          date_to: str | None = None, route_type: int | None = None):
-        return analytics.route_performance(conn(), _csv(routes), date_from, date_to, route_type)
+        """Observed and scheduled trips on one route between two stations."""
+        res = analytics.segment(conn(), route_id, from_, to, date_from, date_to)
+        if res is None:
+            raise HTTPException(404, "unknown station")
+        return res
 
     @app.get("/api/vehicles/live")
     def vehicles_live(routes: str | None = Query(None, description="comma-separated route_ids")):
@@ -136,43 +123,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         as_of = max((r["ts"] for r in rows), default=None)
         return {"as_of": as_of, "vehicles": [dict(r) for r in rows]}
 
-    class SqlRequest(BaseModel):
-        sql: str
+    if (STATIC_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
 
-    @app.post("/api/sql")
-    def run_sql(req: SqlRequest):
-        c = db.connect(db_path, readonly=True)
-        c.execute("PRAGMA query_only = ON")
-        deadline = time.time() + SQL_TIMEOUT_S
-        c.set_progress_handler(lambda: 1 if time.time() > deadline else 0, 10000)
-        try:
-            cur = c.execute(req.sql)
-            cols = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchmany(SQL_ROW_LIMIT + 1)
-        except sqlite3.Error as exc:
-            raise HTTPException(400, str(exc))
-        finally:
-            c.close()
-        return {
-            "columns": cols,
-            "rows": [list(r) for r in rows[:SQL_ROW_LIMIT]],
-            "truncated": len(rows) > SQL_ROW_LIMIT,
-        }
-
-    @app.get("/api/schema")
-    def schema():
-        c = conn()
-        return [
-            {"name": r["name"], "type": r["type"], "sql": r["sql"]}
-            for r in c.execute(
-                "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table','view') "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY type, name")
-        ]
-
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    @app.get("/")
+    @app.get("/", include_in_schema=False)
     def index():
-        return FileResponse(STATIC_DIR / "index.html")
+        page = STATIC_DIR / "index.html"
+        return FileResponse(page) if page.exists() else HTMLResponse(NOT_BUILT)
 
     return app
