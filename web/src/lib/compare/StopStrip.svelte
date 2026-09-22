@@ -7,6 +7,9 @@
 
   let { c }: { c: Comparison } = $props();
   let query = $state("");
+  // phones: the list folds away once the stretch is picked, so the map sits right under the cards
+  let open = $state(true);
+  $effect(() => { open = !(c.from && c.to); });
 
   const load = $derived(c.routeId ? store.details[c.routeId] : undefined);
   const dir = $derived(store.direction(c));
@@ -31,7 +34,7 @@
   }
 </script>
 
-<section class="stops" aria-label="Stops" style:--c="var(--slot-{c.slot + 1})">
+<section class="stops" class:folded={!open} aria-label="Stops" style:--c="var(--slot-{c.slot + 1})">
   {#if !c.routeId}
     <div class="head"><Tag>pick a route above</Tag></div>
   {:else if !load || load.status === "loading"}
@@ -40,11 +43,12 @@
     <div class="head"><Tag kind="bad">{load.error}</Tag></div>
   {:else if dir}
     <div class="head">
-      <div class="title">
+      <button class="title" aria-expanded={open} onclick={() => (open = !open)}>
         {#if route}<RouteBullet short={route.route_short_name} color={route.route_color} mode={mode(route.route_type)} size={22} />{/if}
         <span class="toward"><span class="muted">toward</span> {(dir.headsign ?? "—").replace(/^To /, "")}</span>
         <span class="count">{dir.stations.length} stops</span>
-      </div>
+        <svg class="chev" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+      </button>
       <div class="step"><Slot i={c.slot} size={18} /><b>{step}</b>
         {#if reach && reach.size < dir.stations.length - 1}<span class="muted small">faded: not reached from From</span>{/if}</div>
       <input type="search" placeholder="Find a stop" bind:value={query} aria-label="Filter stops" />
@@ -71,7 +75,9 @@
 <style>
   .stops { padding: 14px 0 24px; }
   .head { padding: 0 16px 8px; display: flex; flex-direction: column; gap: 9px; }
-  .title { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 650; min-width: 0; }
+  .title { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 650; min-width: 0; width: 100%; padding: 0;
+    border: 0; background: none; color: inherit; text-align: left; cursor: default; }
+  .chev { display: none; color: var(--muted); flex: none; transition: transform .15s; }
   .toward { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .toward .muted { font-weight: 450; }
   .count { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 450; white-space: nowrap; }
@@ -100,6 +106,13 @@
   .name { flex: 1; min-width: 0; padding: 5px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   li.from .name, li.to .name { font-weight: 650; }
   .note { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  @media (max-width: 900px) {
+    .title { cursor: pointer; min-height: 30px; }
+    .chev { display: block; }
+    .folded .chev { transform: rotate(-90deg); }
+    .folded input, .folded ol { display: none; }
+    .folded { padding-bottom: 6px; }
+  }
   .role { font-size: 11px; font-weight: 650; color: #fff; background: var(--c); border-radius: 3px; height: 20px; padding: 0 7px;
     display: inline-flex; align-items: center; }
 </style>
