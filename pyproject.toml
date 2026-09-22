@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uta"
+version = "0.0.0"
+description = "UTA transit collector, history database, and dashboard"
+requires-python = ">=3.11"
+dependencies = ["fastapi", "uvicorn", "gtfs-realtime-bindings", "protobuf", "requests"]
+
+[project.scripts]
+uta = "uta.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+uta = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
