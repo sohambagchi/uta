@@ -6,3 +6,4 @@
 - [ ] Route pages: per-stop delay accumulation, headway regularity, bunching
 - [ ] Daily rollup tables if segment payloads get large
 - [ ] Retention policy for `vehicle_positions` (~800k rows/day)
+- [ ] Prune old `*.pre-v*.bak` migration backups (manual for now)

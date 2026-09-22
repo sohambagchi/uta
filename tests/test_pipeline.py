@@ -287,3 +287,44 @@ def test_poll_skips_repeated_snapshots_and_samples_gps(conn, monkeypatch):
     assert nxt["active"] == 1 and nxt["positions"] == 0
     assert serve(at(8, 1, 31), at(8, 1, 31))["positions"] == 1
     assert conn.execute("SELECT COUNT(*) FROM vehicle_positions").fetchone()[0] == 2
+
+
+# ---------------------------------------------------------------- schema guard
+
+def test_newer_database_is_refused(tmp_path):
+    c = db.connect(str(tmp_path / "t.db"))
+    db.init(c)
+    db.set_meta(c, "schema_version", str(db.SCHEMA_VERSION + 1))
+    c.commit()
+    with pytest.raises(db.SchemaMismatch):
+        db.init(c)
+
+
+def test_server_wont_migrate_but_collector_backs_up_first(tmp_path):
+    path = tmp_path / "t.db"
+    c = db.connect(str(path))
+    db.init(c)
+    gtfs_static.import_zip(c, make_zip())
+    db.set_meta(c, "schema_version", "1")
+    c.commit()
+    with pytest.raises(db.SchemaMismatch):
+        create_app(str(path))
+    assert db.get_meta(c, "schema_version") == "1"
+    assert not list(tmp_path.glob("*.bak"))
+
+    db.init(c)  # the collector's path
+    assert db.get_meta(c, "schema_version") == str(db.SCHEMA_VERSION)
+    [bak] = tmp_path.glob("t.db.pre-v*.bak")
+    old = db.connect(str(bak), readonly=True)
+    assert db.get_meta(old, "schema_version") == "1"
+    assert old.execute("SELECT COUNT(*) FROM stops").fetchone()[0] == 4
+
+
+def test_snapshot_cli(conn, tmp_path):
+    from uta.__main__ import main
+    src, dest = tmp_path / "t.db", tmp_path / "snap" / "dev.db"
+    main(["--db", str(src), "snapshot", str(dest)])
+    snap = db.connect(str(dest), readonly=True)
+    assert snap.execute("SELECT COUNT(*) FROM stops").fetchone()[0] == 4
+    with pytest.raises(SystemExit):
+        main(["--db", str(src), "snapshot", str(src)])

@@ -26,6 +26,22 @@ data, so run `collect` (or `up`) continuously. Timetable figures work immediatel
 fill in as data accumulates: a few days gives usable time-of-day patterns, and a few weeks gives
 good day-of-week comparisons.
 
+### Collector as a background service
+
+For long-running collection, run the collector on its own as a systemd user service, separate
+from the dashboard, so development never interrupts it:
+
+```sh
+deploy/install-collector.sh      # build a pinned copy, install + start uta-collector.service
+loginctl enable-linger $USER     # once: keep it running when logged out / after reboot
+journalctl --user -u uta-collector -f
+```
+
+The service runs a build pinned at `~/.local/state/uta/collector`, so later `nix build`s and
+edits in the checkout don't affect it. Re-run the script to upgrade it to the current checkout.
+The dashboard is then just `serve` (from the pinned build or the dev shell) against the same
+database. See the [ADR](docs/adr/2026-09-21-2200-background-collector.md).
+
 ## Development
 
 Everything runs through the flake's dev shell, which provides Python, Node, and sqlite.
@@ -33,8 +49,9 @@ Everything runs through the flake's dev shell, which provides Python, Node, and 
 ```sh
 nix develop
 python -m uta import-gtfs        # one-off: download + load the static timetable (~10 s)
-python -m uta collect            # poll realtime feeds every 10 s (leave running)
-python -m uta serve              # API + built dashboard on :8000
+python -m uta collect            # poll realtime feeds every 10 s (or use the service above)
+python -m uta serve              # API + built dashboard on :8000 (read-only, never migrates)
+python -m uta snapshot           # consistent copy of the live database into data/dev.db
 npm --prefix web install         # once
 npm --prefix web run dev         # dashboard with hot reload on :5173, proxies /api to :8000
 npm --prefix web run build       # build into src/uta/static/ (what `serve` hosts)
@@ -44,6 +61,14 @@ nix build                        # full package: builds web/ and runs pytest
 ```
 
 The database lives at `./data/uta.db`. Override it with `--db` or `$UTA_DB`.
+
+**Protecting collected data.** `serve` reads the database through read-only connections and
+refuses to start if the database needs a migration (pass `--migrate` to override). Migrations
+belong to the collector (`collect` / `up`), which first backs the database up to
+`uta.db.pre-vN-<time>.bak`. Every command refuses a database with a newer schema than it knows,
+so an old pinned collector won't write into a database a newer build migrated. When working on
+schema or query changes, develop against a snapshot:
+`python -m uta snapshot && UTA_DB=data/dev.db python -m uta serve --migrate`.
 
 After changing `web/package-lock.json`, update `npmDepsHash` in `flake.nix`. `nix build .#web`
 prints the new hash.
@@ -157,6 +182,7 @@ src/uta/gtfs_static.py  static GTFS import; derives stations and route_stops
 src/uta/collector.py    realtime polling → stop_events / vehicle_state / vehicle_positions
 src/uta/analytics.py    route, segment, and network queries
 src/uta/server.py       FastAPI app
+deploy/                 systemd user service installer for the collector
 web/                    Svelte + TypeScript dashboard (Vite, MapLibre GL, Observable Plot)
 tests/                  synthetic-feed tests for import, ingestion, and queries
 docs/                   ADRs, changelog, TODO

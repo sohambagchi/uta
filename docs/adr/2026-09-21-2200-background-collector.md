@@ -1,0 +1,8 @@
+# Collector runs as its own pinned service; only the collector migrates
+
+**Status:** accepted
+
+**Context:** The collector ran as a thread inside `uta up`, from a tmux session. Restarting the dashboard to try frontend or query changes stopped collection, and history can't be backfilled (UTA publishes no realtime archive). Any process that opened the database ran `db.init` → `migrate`, so a dev server on a branch that bumped `SCHEMA_VERSION` would migrate, and purge, the live database under the running collector. Migrations can be irreversible.
+**Decision:** The collector runs as `uta-collector.service`, a systemd user service with linger enabled, from a build pinned at `~/.local/state/uta/collector` (`deploy/install-collector.sh` builds, installs, and upgrades it). The dashboard runs separately with `serve`. `db.init` refuses a database newer than the code. `serve` also refuses one that needs migrating unless given `--migrate`, and its request connections are read-only. Before migrating, `db.init` backs the database up next to itself. `uta snapshot` makes a consistent copy (SQLite online backup) for development.
+**Alternatives:** Keep `up` in tmux (dies on restart, logout, and reboot). A NixOS module (the host isn't NixOS-managed). Only document "use a snapshot" without a guard (one mistake loses data).
+**Consequences:** The collector is upgraded deliberately, by re-running the script. A schema mismatch exits with code 2, which the unit doesn't restart on; check `journalctl --user -u uta-collector`. Each migration writes a full backup (~100 MB/day of history), so old `.bak` files need deleting by hand.

@@ -5,9 +5,13 @@ tables (stop_events, vehicle_positions) are append/upsert-only and denormalize
 route/stop/schedule info so history stays meaningful after the GTFS changes.
 """
 
+import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DB = os.environ.get("UTA_DB", str(Path.cwd() / "data" / "uta.db"))
 
@@ -236,7 +240,7 @@ JOIN stops s USING (stop_id);
 def connect(path: str | None = None, readonly: bool = False) -> sqlite3.Connection:
     path = path or DEFAULT_DB
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False, timeout=30)
     else:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
@@ -246,7 +250,51 @@ def connect(path: str | None = None, readonly: bool = False) -> sqlite3.Connecti
     return conn
 
 
-def init(conn: sqlite3.Connection) -> None:
+class SchemaMismatch(RuntimeError):
+    """The database's schema version doesn't match this code and it won't migrate it."""
+
+
+def schema_version(conn: sqlite3.Connection) -> int | None:
+    """Schema version of the database, or None for an empty (new) one."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone():
+        return None
+    return int(get_meta(conn, "schema_version") or 1)
+
+
+def backup(conn: sqlite3.Connection, dest: str) -> None:
+    """Consistent copy of the database, safe while the collector writes (SQLite online backup)."""
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    out = sqlite3.connect(dest)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+
+
+def init(conn: sqlite3.Connection, allow_migrate: bool = True) -> None:
+    """Create the schema and bring the database up to SCHEMA_VERSION.
+
+    Refuses a database newer than this code. With allow_migrate=False, also refuses one that
+    needs migrating, so a dev server can't migrate the live database under the collector.
+    Before migrating, the database is backed up next to itself (migrations can purge data).
+    """
+    version = schema_version(conn)
+    if version is not None and version > SCHEMA_VERSION:
+        raise SchemaMismatch(
+            f"database is schema v{version} but this code only knows v{SCHEMA_VERSION}; "
+            "run a newer build or point --db at another database")
+    if version is not None and version < SCHEMA_VERSION:
+        if not allow_migrate:
+            raise SchemaMismatch(
+                f"database is schema v{version} and this code would migrate it to v{SCHEMA_VERSION}. "
+                "Migrations are left to the collector. For development, snapshot the database "
+                "(`uta snapshot data/dev.db`) and serve that with --db, or pass --migrate.")
+        path = conn.execute("PRAGMA database_list").fetchone()[2]
+        if path:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = f"{path}.pre-v{SCHEMA_VERSION}-{stamp}.bak"
+            log.warning("backing up schema v%d database to %s before migrating", version, dest)
+            backup(conn, dest)
     conn.executescript(SCHEMA)
     migrate(conn)
     conn.executescript(POST_SCHEMA)
@@ -279,7 +327,6 @@ def purge_stale_events(conn: sqlite3.Connection, since: str | None, now: int | N
 
     since: only look at service dates >= this (YYYY-MM-DD); None scans everything.
     """
-    import time
     cutoff = (now or int(time.time())) - FINAL_AFTER_S
     where = f"last_seen < ? AND NOT ({OBSERVED})"
     params: list = [cutoff]

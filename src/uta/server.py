@@ -26,21 +26,26 @@ def _csv(v: str | None) -> list[str] | None:
     return [x.strip() for x in v.split(",") if x.strip()]
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
+def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
+    """migrate: allow bringing an older database up to date (see db.init). Off by default so a
+    dev server can't migrate the live database; the collector owns migrations."""
     app = FastAPI(title="UTA Transit Explorer")
     local = threading.local()
     network_cache: dict = {}
 
     def conn() -> sqlite3.Connection:
-        # one connection per worker thread; FastAPI runs sync endpoints in a pool
+        # one connection per worker thread; FastAPI runs sync endpoints in a pool.
+        # Read-only: nothing served here writes, so query code can't touch collected data.
         c = getattr(local, "conn", None)
         if c is None:
-            c = local.conn = db.connect(db_path)
+            c = local.conn = db.connect(db_path, readonly=True)
         return c
 
     init_conn = db.connect(db_path)
-    db.init(init_conn)
-    init_conn.close()
+    try:
+        db.init(init_conn, allow_migrate=migrate)
+    finally:
+        init_conn.close()
 
     @app.get("/api/status")
     def status():
