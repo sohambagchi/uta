@@ -65,7 +65,8 @@ The database lives at `./data/uta.db`. Override it with `--db` or `$UTA_DB`.
 **Protecting collected data.** `serve` reads the database through read-only connections and
 refuses to start if the database needs a migration (pass `--migrate` to override). Migrations
 belong to the collector (`collect` / `up`), which first backs the database up to
-`uta.db.pre-vN-<time>.bak`. Every command refuses a database with a newer schema than it knows,
+`uta.db.pre-vN-<time>.bak.zst` (zstd; the newest 3 are kept, older ones deleted; restore with
+`zstd -d`). Every command refuses a database with a newer schema than it knows,
 so an old pinned collector won't write into a database a newer build migrated. When working on
 schema or query changes, develop against a snapshot:
 `python -m uta snapshot && UTA_DB=data/dev.db python -m uta serve --migrate`.
@@ -140,10 +141,13 @@ SQLite (WAL mode, safe to read while the collector writes). Local time is Americ
 
 | Table / view | What it holds |
 |---|---|
-| `stop_events` | one row per trip × stop visit: observed and scheduled arrival/departure (epoch s), route, vehicle, `lead_s` |
+| `stop_events` (view) | one row per trip × stop visit: observed and scheduled arrival/departure (epoch s), route, vehicle, `lead_s`. Includes visits outside the observed window |
 | `observed_stop_events` (view) | `stop_events` filtered to observed visits, plus `delay_s`, `hour`, `dow` (0 = Mon), stop name |
-| `vehicle_positions` | GPS pings (vehicle, trip, route, lat/lon, speed m/s, bearing) |
-| `vehicle_state` | vehicles on a trip in the latest poll, with delay and next stop (live views) |
+| `visits`, `visits_new` | compact storage behind `stop_events`: integer keys, times as offsets. `visits_new` holds visits since the last 6-hourly merge |
+| `trip_dim`, `stop_keys`, `route_keys`, `vehicle_keys`, `days` | keys used by `visits`; `trip_dim` keeps each trip's route, headsign, block, shape, and service as observed |
+| `trip_vehicle` | which vehicle ran each trip, per TripUpdates; one row per stretch with the same vehicle |
+| `trip_days`, `day_stats` | per trip/day and per day visit counts |
+| `gps_recent`, `gps_blocks` | GPS pings (one per vehicle per 30 s). Closed days are compressed blocks; read them with `uta.gps.read(conn, t0, t1)` |
 | `polls` | collector health log |
 | `routes`, `stops`, `trips`, `stop_times`, `shapes` | current static GTFS (`stop_times` in seconds after service-day midnight) |
 | `service_dates` | every date each `service_id` runs (calendar + exceptions expanded) |
@@ -164,11 +168,16 @@ WHERE a.stop_id = '5502' AND b.stop_id = '21929'
 GROUP BY route, a.hour;
 ```
 
+Live vehicle state (`vehicle_state`, the latest poll) is kept in a separate small database in
+`$XDG_RUNTIME_DIR` (tmpfs), because it is rewritten every poll.
+
 ## Storage
 
-The static GTFS is about 32 MB. The collector adds about 160k observed stop events a day plus
-about 800k GPS pings (one per vehicle per 30 s), roughly 100 MB a day. Use `collect --no-positions`
-to skip GPS history; the live map doesn't need it.
+The static GTFS is about 32 MB. A weekday of history (about 150k stop visits and 700k GPS
+pings) takes about 10–15 MB: visits about 58 bytes each with indexes, GPS about 6–8 bytes a
+ping once its day is sealed. The collector writes about 2 KB/s to disk. Details:
+[ADR](docs/adr/2026-09-21-2300-compact-history.md). Use `collect --no-positions` to skip GPS
+history; the live map doesn't need it.
 
 UTA regenerates both realtime feeds about every 10 s, so the collector polls every 10 s and the
 live map refreshes at the same rate ([ADR](docs/adr/2026-09-21-2108-poll-cadence.md)).
@@ -179,7 +188,9 @@ live map refreshes at the same rate ([ADR](docs/adr/2026-09-21-2108-poll-cadence
 flake.nix               nix package (web + python), `nix run`, dev shell
 src/uta/db.py           schema, migrations, observed window
 src/uta/gtfs_static.py  static GTFS import; derives stations and route_stops
-src/uta/collector.py    realtime polling → stop_events / vehicle_state / vehicle_positions
+src/uta/collector.py    realtime polling; tracks in-flight visits, batches writes
+src/uta/history.py      compact history writer (keys, visits, trip vehicles) and v2 → v3 migration
+src/uta/gps.py          GPS block codec, sealing, and reading
 src/uta/analytics.py    route, segment, and network queries
 src/uta/server.py       FastAPI app
 deploy/                 systemd user service installer for the collector

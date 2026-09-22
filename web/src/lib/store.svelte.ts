@@ -18,7 +18,8 @@ export interface Comparison {
 
 export type Load<T> = { status: "loading" } | { status: "ok"; data: T } | { status: "error"; error: string };
 
-const DEFAULT_FILTERS: Filters = { range: "30", dows: [], hourFrom: 0, hourTo: 24, trim: true, bin: 60 };
+// default: every day of history
+const DEFAULT_FILTERS: Filters = { range: "", from: null, to: null, dows: [], hourFrom: 3, hourTo: 27, trim: true, bin: 60 };
 
 let nextId = 1;
 
@@ -165,12 +166,16 @@ class Store {
   }
 
   dateFrom(): string | undefined {
-    return this.filters.range ? denverDaysAgo(+this.filters.range) : undefined;
+    return this.filters.from ?? (this.filters.range ? denverDaysAgo(+this.filters.range) : undefined);
+  }
+
+  dateTo(): string | undefined {
+    return this.filters.to ?? undefined;
   }
 
   segmentKey(c: Comparison): string | null {
     if (!c.routeId || !c.from || !c.to) return null;
-    return [c.routeId, c.from, c.to, this.dateFrom() ?? ""].join("|");
+    return [c.routeId, c.from, c.to, this.dateFrom() ?? "", this.dateTo() ?? ""].join("|");
   }
 
   segment(c: Comparison): Load<Segment> | undefined {
@@ -183,7 +188,7 @@ class Store {
     if (!k || this.segments[k]) return;
     this.segments[k] = { status: "loading" };
     try {
-      const data = await api.segment(c.routeId!, c.from!, c.to!, this.dateFrom());
+      const data = await api.segment(c.routeId!, c.from!, c.to!, this.dateFrom(), this.dateTo());
       this.segments[k] = { status: "ok", data };
       this.lastGood[c.id] = data;
     } catch (e) {
@@ -212,9 +217,10 @@ class Store {
       .map((c) => [c.routeId, c.directionId, c.from ?? "", c.to ?? ""].join("~"));
     if (cs.length) p.set("c", cs.join(","));
     const f = this.filters;
-    if (f.range !== DEFAULT_FILTERS.range) p.set("range", f.range || "all");
+    if (f.from) p.set("from", f.from);
+    if (f.to) p.set("to", f.to);
     if (f.dows.length) p.set("d", f.dows.join(""));
-    if (f.hourFrom !== 0 || f.hourTo !== 24) p.set("h", `${f.hourFrom}-${f.hourTo}`);
+    if (f.hourFrom !== DEFAULT_FILTERS.hourFrom || f.hourTo !== DEFAULT_FILTERS.hourTo) p.set("h", `${f.hourFrom}-${f.hourTo}`);
     if (!f.trim) p.set("trim", "0");
     if (f.bin !== DEFAULT_FILTERS.bin) p.set("bin", String(f.bin));
     return p.toString();
@@ -224,11 +230,15 @@ class Store {
     const p = new URLSearchParams(hash.replace(/^#/, ""));
     const f = { ...DEFAULT_FILTERS };
     const range = p.get("range");
-    if (range) f.range = range === "all" ? "" : range;
+    // old links: range=N days back (or "all") becomes an explicit start date
+    if (range && range !== "all") f.from = denverDaysAgo(+range);
+    f.from = p.get("from") ?? f.from;
+    f.to = p.get("to");
     const d = p.get("d");
     if (d) f.dows = [...d].map(Number).filter((x) => x >= 0 && x < 7);
     const h = p.get("h")?.split("-").map(Number);
-    if (h?.length === 2 && h.every(isFinite)) [f.hourFrom, f.hourTo] = h;
+    // old links used clock hours 0–24 (all day)
+    if (h?.length === 2 && h.every(isFinite) && !(h[0] === 0 && h[1] === 24)) [f.hourFrom, f.hourTo] = h;
     if (p.get("trim") === "0") f.trim = false;
     const bin = Number(p.get("bin"));
     if ([15, 30, 60, 120].includes(bin)) f.bin = bin;

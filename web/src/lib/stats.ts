@@ -5,10 +5,12 @@
 import type { Observed, Scheduled } from "./api";
 
 export interface Filters {
-  range: string;          // "1" | "7" | "30" | "90" | "" (all)
+  range: string;          // legacy "days back" from old links ("" = all); from/to win
+  from: string | null;    // first service date (YYYY-MM-DD), null = start of history
+  to: string | null;      // last service date, null = latest
   dows: number[];         // empty = every day
-  hourFrom: number;       // 0..23, departure hour >= hourFrom
-  hourTo: number;         // 1..24, departure hour < hourTo
+  hourFrom: number;       // service-day hour (3..26), departure hour >= hourFrom
+  hourTo: number;         // service-day hour (4..27; 24+ is after midnight), departure hour < hourTo
   trim: boolean;          // drop far outliers (Tukey 3×IQR)
   bin: number;            // minutes per time-of-day bin
 }
@@ -45,7 +47,9 @@ export interface Summary {
 function inTime(dow: number, minute: number, f: Filters): boolean {
   if (f.dows.length && !f.dows.includes(dow)) return false;
   const h = minute / 60;
-  return h >= f.hourFrom && h < f.hourTo;
+  // minute is the local clock; hours before 03:00 belong to the previous service day (24–27)
+  const sh = h < 3 ? h + 24 : h;
+  return sh >= f.hourFrom && sh < f.hourTo;
 }
 
 export function filterTrips(o: Observed, f: Filters): { trips: Trip[]; trimmed: number } {

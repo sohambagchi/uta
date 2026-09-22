@@ -9,8 +9,10 @@ bounds how much data is sent.
 import math
 import sqlite3
 from collections import Counter, defaultdict
+from datetime import date
 
-from .db import observed
+from .db import EPOCH, observed
+from .insights import NON_PASSENGER
 from .timeutil import local
 
 # Observed travel times outside this range are data errors, not trips.
@@ -56,7 +58,7 @@ def route_detail(conn: sqlite3.Connection, route_id: str) -> dict | None:
             SELECT rs.seq, rs.station_id, st.name, st.lat, st.lon, rs.stop_ids, rs.n_trips
             FROM route_stops rs JOIN stations st USING (station_id)
             WHERE rs.route_id = ? AND rs.direction_id = ? ORDER BY rs.seq
-            """, (route_id, direction_id))]
+            """, (route_id, direction_id)) if not NON_PASSENGER.search(r["name"] or "")]
         for s in stations:
             s["stop_ids"] = s["stop_ids"].split()
         head = conn.execute(
@@ -239,31 +241,50 @@ def _empty_observed() -> dict:
 
 def observed_samples(conn, route_id, from_ids, to_ids, date_from=None, date_to=None) -> dict:
     """Columnar observed trips A->B, oldest first. minute/dow are local departure time."""
-    params: list = [route_id, *from_ids, *to_ids]
-    extra = ""
+    route = conn.execute("SELECT key FROM route_keys WHERE route_id = ?", (route_id,)).fetchone()
+    stops = dict(conn.execute(
+        f"SELECT stop_id, key FROM stop_keys WHERE stop_id IN ({_in(from_ids + to_ids)})", [*from_ids, *to_ids]))
+    a_keys = [stops[s] for s in from_ids if s in stops]
+    b_keys = [stops[s] for s in to_ids if s in stops]
+    if route is None or not a_keys or not b_keys:
+        return _empty_observed()
+    days, day_params = "", []
     if date_from:
-        extra += " AND a.service_date >= ?"
-        params.append(date_from)
+        days += " AND day >= ?"
+        day_params.append((date.fromisoformat(date_from) - EPOCH).days)
     if date_to:
-        extra += " AND a.service_date <= ?"
-        params.append(date_to)
+        days += " AND day <= ?"
+        day_params.append((date.fromisoformat(date_to) - EPOCH).days)
+    params: list = []
+
+    # Each side is a range scan on the visits primary key (route, stop, day, ...), plus a
+    # scan of the small staging table (visits_new: visits since the last merge, <= 6 h).
+    def side(keys):
+        where = f"route = ? AND stop IN ({_in(keys)}){days}"
+        params.extend([route[0], *keys, *day_params] * 2)
+        return f"SELECT * FROM visits WHERE {where} UNION ALL SELECT * FROM visits_new WHERE {where}"
+
     rows = conn.execute(
         f"""
-        SELECT a.service_date, a.trip_id, a.vehicle_id,
-               a.stop_sequence AS a_seq, b.stop_sequence AS b_seq,
-               COALESCE(a.obs_departure, a.obs_arrival) AS t0, b.obs_arrival AS t1,
-               COALESCE(a.sched_departure, a.sched_arrival) AS s0, b.sched_arrival AS s1
-        FROM stop_events a
-        JOIN stop_events b
-          ON b.service_date = a.service_date AND b.trip_id = a.trip_id
-         AND b.stop_sequence > a.stop_sequence
-        WHERE a.route_id = ? AND a.stop_id IN ({_in(from_ids)}) AND b.stop_id IN ({_in(to_ids)})
-          AND {observed("a")} AND {observed("b")} {extra}
+        WITH a AS ({side(a_keys)}),
+             b AS ({side(b_keys)})
+        SELECT d.service_date, t.trip_id, vk.vehicle_id,
+               a.seq AS a_seq, b.seq AS b_seq,
+               d.origin + a.arr + COALESCE(a.dwell, 0) AS t0, d.origin + b.arr AS t1,
+               d.origin + a.arr - a.delay + COALESCE(a.sched_dwell, 0) AS s0, d.origin + b.arr - b.delay AS s1
+        FROM a
+        JOIN b ON b.day = a.day AND b.trip = a.trip AND b.seq > a.seq
+        JOIN days d ON d.day = a.day
+        JOIN trip_dim t ON t.key = a.trip
+        LEFT JOIN vehicle_keys vk ON vk.key = a.vehicle
+        WHERE {observed("a")} AND {observed("b")}
         """,
         params,
     ).fetchall()
     out = _empty_observed()
     for r in sorted(_tightest(rows, lambda r: (r["service_date"], r["trip_id"])), key=lambda r: r["t0"]):
+        if r["t0"] is None or r["t1"] is None:
+            continue
         dur = r["t1"] - r["t0"]
         if not 0 < dur <= MAX_TRAVEL_S:
             continue
