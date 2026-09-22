@@ -12,15 +12,15 @@
   let w = $state(1200);
 
   const RH = 22, TOP = 30, BOT = 24, GAP = 18;
-  // phones: the station axis keeps only the delay column (the Marey needs width)
+  // phones: the station axis shows one column at a time; the Marey scrolls sideways under fixed labels
   const compact = $derived(w < 700);
+  let view = $state<"delay" | "marey" | "dwell">("delay");
   const LW = $derived(compact ? Math.min(170, Math.floor(w * 0.46)) : 190);
   const AW = $derived(compact ? Math.max(140, w - LW - 4) : 240);
-  const DW = 140;
+  const DW = $derived(compact ? Math.max(140, w - LW - 4) : 140);
   const ns = $derived(r.stations.length);
   const H = $derived(TOP + ns * RH + BOT);
   const ys = (i: number) => TOP + i * RH + RH / 2;
-  const mw = $derived(Math.max(300, w - LW - AW - DW - 2 * GAP));
   const noRt = $derived(new Set(r.marey.no_rt ?? []));
 
   // time domain: every timetable and observed point on the Marey day
@@ -38,6 +38,7 @@
     if (b <= a) b = a + 3600;
     return [Math.floor(a / 1800) * 1800 - 900, Math.ceil(b / 1800) * 1800 + 900];
   });
+  const mw = $derived(compact ? Math.max(w - LW, ((tdom[1] - tdom[0]) / 3600) * 64) : Math.max(300, w - LW - AW - DW - 2 * GAP));
   const x = $derived(lin(tdom[0], tdom[1], 6, mw - 6));
   const step = $derived((tdom[1] - tdom[0]) / 3600 > 14 ? 2 : 1);
   const line = (pts: [number, number][]) => (pts.length > 1 ? "M" + pts.map(([a, b]) => `${a.toFixed(1)},${b.toFixed(1)}`).join("L") : "");
@@ -47,6 +48,17 @@
   ]);
   const obsTrips = $derived(r.marey.trips.filter((t) => t.obs.length > 1).map((t) => ({ t, d: line(t.obs.map(([i, a]) => [x(a), ys(i)])) })));
   let hot = $state<string | null>(null);
+  // touch has no hover: the first tap on a trip shows its tip, a second tap opens it
+  // (read at pointerdown: Android fires the emulated mouseenter before the click)
+  let touch = false, armed = false;
+  function press(e: PointerEvent, t: RouteDay["marey"]["trips"][number]) {
+    touch = e.pointerType !== "mouse";
+    armed = hot === t.trip_id;
+  }
+  function open(e: MouseEvent, t: RouteDay["marey"]["trips"][number]) {
+    if (touch && !armed) return hover(e, t);
+    router.go(`trip/${t.trip_id}`, { date: r.marey.date }, false);
+  }
 
   function hover(e: MouseEvent, t: RouteDay["marey"]["trips"][number]) {
     hot = t.trip_id;
@@ -100,28 +112,7 @@
   }
 </script>
 
-<div bind:clientWidth={w} class="wrap">
-  {#if compact}
-    <div class="heads" style:grid-template-columns="{LW}px {AW}px"><span></span><span>DELAY AT STOP</span></div>
-  {:else}
-    <div class="heads" style:grid-template-columns="{LW}px {mw}px {GAP}px {AW}px {GAP}px {DW}px">
-      <span></span><span>TIME-SPACE · {r.marey.date}</span><span></span><span>DELAY AT STOP · MEDIAN, P10–P90</span><span></span><span>DWELL · VS TIMETABLE</span>
-    </div>
-  {/if}
-  <div class="cols">
-    <!-- strip map -->
-    <svg class="chart" width={LW} height={H} role="img" aria-label="Stations">
-      <line x1={LW - 14} x2={LW - 14} y1={ys(0)} y2={ys(ns - 1)} stroke={color} stroke-width="5" />
-      {#each r.stations as s, i}
-        <circle cx={LW - 14} cy={ys(i)} r={i === 0 || i === ns - 1 ? 4.2 : 3.2} fill="var(--panel)" stroke={color} stroke-width="2"
-          stroke-dasharray={noRt.has(i) ? "2 2" : undefined} />
-        <a href={router.href(`stations/${s.station_id}`)}>
-          <text x={LW - 26} y={ys(i) + 4} text-anchor="end" style="font-size: 11.5px; fill: {noRt.has(i) ? 'var(--faint)' : 'var(--ink)'}; font-weight: {i === 0 || i === ns - 1 ? 600 : 450}">{fit(short(s.name), LW - 30)}</text>
-        </a>
-      {/each}
-    </svg>
-
-    {#if !compact}
+{#snippet marey()}
     <!-- Marey -->
     <svg class="chart" width={mw} height={H} role="img" aria-label="Time-space diagram of every trip">
       <Hatch {id} />
@@ -148,13 +139,45 @@
         <!-- wide invisible hit area -->
         <path {d} fill="none" stroke="transparent" stroke-width="9" style="cursor: pointer" role="link" tabindex="-1"
           onmouseenter={(e) => hover(e, t)} onmousemove={(e) => hover(e, t)} onmouseleave={() => { hot = null; tip.hide(); }}
-          onclick={() => router.go(`trip/${t.trip_id}`, { date: r.marey.date }, false)} onkeydown={() => {}} />
+          onpointerdown={(e) => press(e, t)} onclick={(e) => open(e, t)} onkeydown={() => {}} />
       {/each}
       </g>
     </svg>
+{/snippet}
+
+<div bind:clientWidth={w} class="wrap">
+  {#if compact}
+    <div class="views" role="group" aria-label="Column">
+      {#each [["delay", "Delay"], ["marey", "Time-space"], ["dwell", "Dwell"]] as [k, label]}
+        <button class="chip" aria-pressed={view === k} onclick={() => { view = k as typeof view; tip.hide(); }}>{label}</button>
+      {/each}
+    </div>
+  {:else}
+    <div class="heads" style:grid-template-columns="{LW}px {mw}px {GAP}px {AW}px {GAP}px {DW}px">
+      <span></span><span>TIME-SPACE · {r.marey.date}</span><span></span><span>DELAY AT STOP · MEDIAN, P10–P90</span><span></span><span>DWELL · VS TIMETABLE</span>
+    </div>
+  {/if}
+  <div class="cols">
+    <!-- strip map -->
+    <svg class="chart" width={LW} height={H} role="img" aria-label="Stations">
+      <line x1={LW - 14} x2={LW - 14} y1={ys(0)} y2={ys(ns - 1)} stroke={color} stroke-width="5" />
+      {#each r.stations as s, i}
+        <circle cx={LW - 14} cy={ys(i)} r={i === 0 || i === ns - 1 ? 4.2 : 3.2} fill="var(--panel)" stroke={color} stroke-width="2"
+          stroke-dasharray={noRt.has(i) ? "2 2" : undefined} />
+        <a href={router.href(`stations/${s.station_id}`)}>
+          <text x={LW - 26} y={ys(i) + 4} text-anchor="end" style="font-size: 11.5px; fill: {noRt.has(i) ? 'var(--faint)' : 'var(--ink)'}; font-weight: {i === 0 || i === ns - 1 ? 600 : 450}">{fit(short(s.name), LW - 30)}</text>
+        </a>
+      {/each}
+    </svg>
+
+    {#if !compact}
+    {@render marey()}
     <div style:width="{GAP}px"></div>
+    {:else if view === "marey"}
+    <div class="scroll" style:width="{w - LW}px">{@render marey()}</div>
     {/if}
 
+    {#if !compact || view === "delay"}
     <!-- delay accumulation -->
     <svg class="chart" width={AW} height={H} role="img" aria-label="Delay by station">
       <Hatch id="{id}a" />
@@ -187,9 +210,10 @@
           style="fill: var(--ink-2); font-size: 10.5px; font-weight: 600; paint-order: stroke; stroke: var(--panel); stroke-width: 4px">{delay(worst.median)}</text>
       {/if}
     </svg>
-    {#if !compact}
-    <div style:width="{GAP}px"></div>
+    {/if}
+    {#if !compact}<div style:width="{GAP}px"></div>{/if}
 
+    {#if !compact || view === "dwell"}
     <!-- dwell -->
     <svg class="chart" width={DW} height={H} role="img" aria-label="Dwell by station">
       {#each wticks as v}
@@ -214,6 +238,9 @@
   .wrap { overflow-x: auto; }
   .heads { display: grid; font-size: 11px; font-weight: 650; color: var(--muted); letter-spacing: .05em; font-stretch: 90%; }
   .cols { display: flex; }
+  .views { display: flex; gap: 4px; margin-bottom: 4px; }
+  .scroll { overflow-x: auto; overscroll-behavior-x: contain; }
   .cols > :global(*) { flex-shrink: 0; }
   a text:hover { text-decoration: underline; }
+  path[role="link"]:focus { outline: none; }
 </style>
