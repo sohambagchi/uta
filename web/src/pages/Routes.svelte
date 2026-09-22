@@ -2,7 +2,7 @@
   import { insights } from "../lib/api";
   import { app, load } from "../lib/app.svelte";
   import { router } from "../lib/router.svelte";
-  import { delay, pct, MODE_LABEL, title } from "../lib/format";
+  import { delay, pct, MODE_LABEL, modeOf, title } from "../lib/format";
   import ScopeBar from "../lib/ui/ScopeBar.svelte";
   import PageTitle from "../lib/ui/PageTitle.svelte";
   import Panel from "../lib/ui/Panel.svelte";
@@ -12,8 +12,6 @@
   import NBadge from "../lib/ui/NBadge.svelte";
   import Loading from "../lib/ui/Loading.svelte";
 
-  // same rule as the backend (insights.mode_of): route_type 0 is TRAX, except the S-Line streetcar
-  const mode_of = (t: number, short: string) => (t === 2 ? "rail" : t === 0 ? (short === "720" ? "streetcar" : "lrt") : "bus");
   $effect(() => { app.loadNetwork(); });
   const res = load(() => { app.tick; return insights.network(router.scopeParams()); });
   let filter = $state(router.get("q") ?? "");
@@ -22,7 +20,7 @@
   const groups = $derived.by(() => {
     const f = filter.trim().toLowerCase();
     const rows = app.routes
-      .map((r) => ({ r, mode: mode_of(r.route_type, r.route_short_name), s: stats.get(r.route_id) }))
+      .map((r) => ({ r, mode: modeOf(r.route_type, r.route_short_name), s: stats.get(r.route_id) }))
       .filter(({ r }) => !f || r.route_short_name.toLowerCase().includes(f) || (r.route_long_name ?? "").toLowerCase().includes(f));
     return ORDER.map((m) => ({ m, rows: rows.filter((x) => x.mode === m) })).filter((g) => g.rows.length);
   });

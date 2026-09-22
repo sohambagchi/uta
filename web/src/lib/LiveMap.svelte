@@ -9,7 +9,7 @@
   import { api, type Vehicle, type LngLat } from "./api";
   import { app } from "./app.svelte";
   import { theme } from "./theme.svelte";
-  import { delay as fmtDelay, epochClock, title } from "./format";
+  import { delay as fmtDelay, epochClock, title, modeOf, MODE_LABEL } from "./format";
   import Tag from "./ui/Tag.svelte";
   import Info from "./ui/Info.svelte";
 
@@ -195,6 +195,14 @@
     for (const v of vehicles) { const k = binOf(v.delay_s)?.key ?? "none"; m[k] = (m[k] ?? 0) + 1; }
     return m;
   });
+  const MODES = ["bus", "lrt", "streetcar", "rail"];
+  const byMode = $derived.by(() => {
+    const m: Record<string, number> = {};
+    for (const v of vehicles) { const k = modeOf(v.route_type, v.route_short_name); m[k] = (m[k] ?? 0) + 1; }
+    return m;
+  });
+  // phones: the delay rows fold behind the header so the legend doesn't cover the map
+  let open = $state(false);
 
   $effect(() => { app.lines; app.routes; pushNetwork(); });
 
@@ -249,19 +257,27 @@
 
 <div class="map" bind:this={container}></div>
 
-<div class="legend">
+<div class="legend" class:open>
   <div class="top">
     <span class="dot" class:off={liveError || !vehicles.length}></span>
     <b>{vehicles.length.toLocaleString("en-US")}</b><span class="k">vehicles</span>
     <span class="t mono">{asOf ? epochClock(asOf) : "—"}</span>
     <Info text="Vehicles on a trip in the collector's latest poll, coloured by predicted delay at their next stop. Updates every 10 s." />
+    <button class="chev" aria-expanded={open} aria-label="Delay breakdown" onclick={() => (open = !open)}>
+      <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 7.5l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    </button>
   </div>
+  <div class="modes">
+    {#each MODES as m}<span class:zero={!byMode[m]}><b>{byMode[m] ?? 0}</b> {MODE_LABEL[m]}</span>{/each}
+  </div>
+  <div class="bins">
   {#if loaded && liveError}<Tag kind="bad">feed unavailable</Tag>
   {:else if loaded && !vehicles.length}<Tag kind="warn">collector not running</Tag>{/if}
   {#each BINS as b}
     <div class="r"><span class="sw" style:background="var({b.v})"></span><span class="lb">{b.label}</span><span class="n">{counts[b.key] ?? 0}</span></div>
   {/each}
   <div class="r"><span class="sw" style:background="var(--faint)"></span><span class="lb">no estimate</span><span class="n">{counts.none ?? 0}</span></div>
+  </div>
 </div>
 
 <style>
@@ -269,6 +285,14 @@
   .legend { position: absolute; left: 12px; bottom: 28px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
     padding: 10px 12px; display: grid; gap: 4px; min-width: 190px; font-size: 12px; color: var(--ink-2); }
   .top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .chev { display: none; place-items: center; width: 28px; height: 28px; margin: -6px -6px -6px 0; padding: 0; border: 0; background: none;
+    color: var(--muted); flex: none; }
+  .chev svg { transition: transform .15s; }
+  .modes { display: grid; grid-template-columns: auto auto; gap: 2px 14px; padding-bottom: 6px; margin-bottom: 2px; border-bottom: 1px solid var(--grid); }
+  .modes b { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+  .modes .zero { color: var(--faint); }
+  .modes .zero b { color: var(--faint); }
+  .bins { display: grid; gap: 4px; }
   .top b { font-size: 18px; color: var(--ink); font-weight: 650; }
   .k { color: var(--muted); }
   .t { margin-left: auto; color: var(--muted); font-size: 11px; }
@@ -288,5 +312,12 @@
   :global(.lv-k) { color: var(--muted); }
   :global(.lv-meta) { color: var(--muted); font-family: var(--mono); font-size: 11px; }
   :global(.lv-links) { display: flex; gap: 14px; margin-top: 2px; font-weight: 600; }
-  @media (max-width: 600px) { .legend { display: none; } }
+  @media (max-width: 600px) {
+    .legend { left: 8px; bottom: 42px; min-width: 0; padding: 8px 10px; }
+    .top { margin-bottom: 2px; }
+    .chev { display: grid; }
+    .legend.open .chev svg { transform: rotate(180deg); }
+    .legend:not(.open) .bins { display: none; }
+    .legend:not(.open) .modes { border-bottom: 0; padding-bottom: 0; }
+  }
 </style>

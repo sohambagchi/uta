@@ -84,6 +84,9 @@ export function title(s: string | null | undefined): string {
   return s === s.toUpperCase() ? s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : s;
 }
 export const MODE_LABEL: Record<string, string> = { bus: "Bus", lrt: "Light rail", streetcar: "Streetcar", rail: "FrontRunner" };
+/** Same rule as the backend (insights.mode_of): route_type 0 is TRAX, except the S-Line streetcar. */
+export const modeOf = (t: number | null | undefined, short: string | null | undefined) =>
+  t === 2 ? "rail" : t === 0 ? (short === "720" ? "streetcar" : "lrt") : "bus";
 
 /** Diverging delay colour: early (blue) | on time (grey) | late ramp (amber → oxblood). */
 export function dcol(s: number | null | undefined): string {
