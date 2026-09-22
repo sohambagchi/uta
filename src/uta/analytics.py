@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from datetime import date
 
 from .db import EPOCH, observed
+from .insights import NON_PASSENGER
 from .timeutil import local
 
 # Observed travel times outside this range are data errors, not trips.
@@ -57,7 +58,7 @@ def route_detail(conn: sqlite3.Connection, route_id: str) -> dict | None:
             SELECT rs.seq, rs.station_id, st.name, st.lat, st.lon, rs.stop_ids, rs.n_trips
             FROM route_stops rs JOIN stations st USING (station_id)
             WHERE rs.route_id = ? AND rs.direction_id = ? ORDER BY rs.seq
-            """, (route_id, direction_id))]
+            """, (route_id, direction_id)) if not NON_PASSENGER.search(r["name"] or "")]
         for s in stations:
             s["stop_ids"] = s["stop_ids"].split()
         head = conn.execute(

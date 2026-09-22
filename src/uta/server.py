@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import analytics, db
+from . import analytics, db, insights
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -157,6 +157,92 @@ def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
             r["next_stop_name"] = stop_names.get(r["next_stop_id"])
         as_of = max((r["ts"] for r in rows), default=None)
         return {"as_of": as_of, "vehicles": rows}
+
+    ins = insights.Insights(conn)
+
+    def scope(date_from, date_to, dows, h, modes):
+        return ins.scope(date_from, date_to, dows, h, modes)
+
+    Scope = dict(
+        date_from=Query(None, alias="from", description="first service date, YYYY-MM-DD (default: latest)"),
+        date_to=Query(None, alias="to", description="last service date (default: latest with data)"),
+        dows=Query(None, description="weekdays to keep, e.g. 01234 (0=Mon)"),
+        h=Query(None, description="service-day hours, e.g. 5-29"),
+        modes=Query(None, description="comma-separated: bus,lrt,streetcar,rail"),
+    )
+
+    @app.get("/api/days")
+    def days():
+        """Service days with observed visits."""
+        return ins.days_with_data()
+
+    @app.get("/api/insights/network")
+    def insights_network(date_from: str | None = Scope["date_from"], date_to: str | None = Scope["date_to"],
+                         dows: str | None = Scope["dows"], h: str | None = Scope["h"], modes: str | None = Scope["modes"]):
+        """KPIs, modes, hours, route ranking, fleet curve and station delays over a scope."""
+        sc = scope(date_from, date_to, dows, h, modes)
+        return insights.network_summary(ins, sc)
+
+    @app.get("/api/insights/route/{route_id}/{direction_id}")
+    def insights_route(route_id: str, direction_id: int, at: str | None = Query(None, description="headway station_id"),
+                       date_from: str | None = Scope["date_from"], date_to: str | None = Scope["date_to"],
+                       dows: str | None = Scope["dows"], h: str | None = Scope["h"]):
+        """One route direction: delay by station, running time, and the last day's Marey diagram and headways."""
+        res = insights.route_day(ins, scope(date_from, date_to, dows, h, None), route_id, direction_id, at)
+        if res is None:
+            raise HTTPException(404, "unknown route")
+        return res
+
+    @app.get("/api/insights/station/{station_id}")
+    def insights_station(station_id: str, until: int | None = Query(None, description="board end, service-day seconds"),
+                         xf: str | None = Query(None, description="transfer from route_id"),
+                         xt: str | None = Query(None, description="transfer to route_id"),
+                         date_from: str | None = Scope["date_from"], date_to: str | None = Scope["date_to"],
+                         dows: str | None = Scope["dows"], h: str | None = Scope["h"], modes: str | None = Scope["modes"]):
+        res = insights.station_view(ins, scope(date_from, date_to, dows, h, modes), station_id, until, xf, xt)
+        if res is None:
+            raise HTTPException(404, "unknown station")
+        return res
+
+    @app.get("/api/insights/trip/{trip_id}")
+    def insights_trip(trip_id: str, date: str | None = Query(None, description="service date")):
+        res = insights.trip_view(ins, trip_id, date)
+        if res is None:
+            raise HTTPException(404, "unknown trip")
+        return res
+
+    @app.get("/api/insights/vehicle/{vehicle_id}")
+    def insights_vehicle(vehicle_id: str, date: str | None = Query(None, description="service date")):
+        res = insights.vehicle_view(ins, vehicle_id, date)
+        if res is None:
+            raise HTTPException(404, "unknown vehicle")
+        return res
+
+    @app.get("/api/insights/vehicle/{vehicle_id}/gps")
+    def insights_vehicle_gps(vehicle_id: str, date: str | None = Query(None, description="service date")):
+        """The vehicle's GPS pings over its service day."""
+        res = insights.vehicle_gps(ins, vehicle_id, date)
+        if res is None:
+            raise HTTPException(404, "unknown vehicle")
+        return res
+
+    @app.get("/api/insights/vehicles")
+    def insights_vehicles(date_to: str | None = Scope["date_to"]):
+        """Vehicles that ran trips on a service day."""
+        return insights.vehicles_on_day(ins, scope(None, date_to, None, None, None))
+
+    @app.get("/api/insights/health")
+    def insights_health(date_from: str | None = Scope["date_from"], date_to: str | None = Scope["date_to"]):
+        return insights.health(ins, scope(date_from, date_to, None, None, None))
+
+    @app.get("/api/insights/stations")
+    def insights_hubs():
+        """Stations served by the most routes."""
+        return insights.hubs(ins)
+
+    @app.get("/api/search")
+    def search(q: str = ""):
+        return insights.search(ins, q)
 
     if (STATIC_DIR / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
