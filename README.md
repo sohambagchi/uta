@@ -55,6 +55,7 @@ python -m uta snapshot           # consistent copy of the live database into dat
 npm --prefix web install         # once
 npm --prefix web run dev         # dashboard with hot reload on :5173, proxies /api to :8000
 npm --prefix web run build       # build into src/uta/static/ (what `serve` hosts)
+npm --prefix web run watch       # same, rebuilding on every change (refresh the page to see it)
 npm --prefix web run check       # svelte-check / TypeScript
 pytest                           # backend tests
 nix build                        # full package: builds web/ and runs pytest

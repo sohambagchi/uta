@@ -244,8 +244,8 @@ def create_app(db_path: str | None = None, migrate: bool = False) -> FastAPI:
     def search(q: str = ""):
         return insights.search(ins, q)
 
-    if (STATIC_DIR / "assets").is_dir():
-        app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+    # check_dir=False: `npm run watch` may create (and re-create) the directory after startup.
+    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets", check_dir=False), name="assets")
 
     @app.get("/", include_in_schema=False)
     def index():
