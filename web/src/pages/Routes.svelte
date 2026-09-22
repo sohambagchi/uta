@@ -80,9 +80,10 @@
   .fixed { table-layout: fixed; min-width: 760px; }
   .fixed :global(td) { overflow: hidden; text-overflow: ellipsis; }
   .rn { max-width: 100%; }
-  .dirs { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+  .dirs { color: var(--muted); padding-top: 3px; padding-bottom: 3px; }
   .sk { display: block; height: 10px; width: 60%; border-radius: 2px; background: var(--sunk); }
-  .dirs a { color: var(--ink-2); margin-right: 10px; font-size: 12px; }
+  /* one direction per line so the second never gets clipped by the fixed column */
+  .dirs a { display: block; color: var(--ink-2); font-size: 12px; line-height: 16px; overflow: hidden; text-overflow: ellipsis; }
   .ot { display: inline-flex; align-items: center; gap: 8px; }
   .ot b { width: 36px; text-align: right; font-weight: 650; }
   .bar { width: 44px; height: 8px; background: var(--sunk); display: inline-block; }

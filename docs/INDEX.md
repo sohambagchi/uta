@@ -28,3 +28,4 @@
 - [2026-09-21-2300-compact-history](changelog/2026-09-21-2300-compact-history.md) — schema v3
 - [2026-09-22-0025-analytics-dashboard](changelog/2026-09-22-0025-analytics-dashboard.md) — analytics dashboard
 - [2026-09-22-1100-station-search](changelog/2026-09-22-1100-station-search.md) — word-based station search
+- [2026-09-22-1130-mobile-pass](changelog/2026-09-22-1130-mobile-pass.md) — phone-width fixes
