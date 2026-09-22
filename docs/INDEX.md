@@ -1,5 +1,9 @@
 # Index
 
+## Analysis
+
+- [2026-09-21-2322-claude-design-prompt](analysis-artifacts/2026-09-21-2322-claude-design-prompt.md) — Claude Design brief: question space the data supports and the UI to design for it
+
 ## Decisions
 
 - [2026-09-21-2016-observed-lead-window](adr/2026-09-21-2016-observed-lead-window.md) — what counts as an observed stop visit (deletion superseded by v3)
