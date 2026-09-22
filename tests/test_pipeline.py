@@ -1,8 +1,10 @@
 """End-to-end tests on a tiny synthetic GTFS feed + synthetic realtime updates."""
 
 import io
+import time
 import zipfile
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -456,7 +458,11 @@ CREATE TABLE vehicle_positions (
 """
 
 
-def test_migration_from_v2_is_lossless(tmp_path):
+def test_migration_from_v2_is_lossless(tmp_path, monkeypatch):
+    # the migration seals GPS days and purges by wall clock: pin it to the night after MON
+    now = lambda: at(25)
+    monkeypatch.setattr(history, "time", SimpleNamespace(time=now))
+    monkeypatch.setattr(db, "time", SimpleNamespace(time=now, strftime=time.strftime))
     path = tmp_path / "v2.db"
     c = db.connect(str(path))
     db.init(c)
