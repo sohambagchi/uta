@@ -18,6 +18,9 @@
     return (dir?.stations ?? []).map((s, i) => ({ s, i })).filter(({ s }) => !q || s.name.toLowerCase().includes(q));
   });
 
+  const prompt = $derived(!c.from ? "Tap the stop where you get on" : !c.to ? "Now tap where you get off"
+    : "Tap any stop to start over");
+
   function role(i: number): "from" | "to" | "between" | null {
     if (i === fromIdx) return "from";
     if (i === toIdx) return "to";
@@ -28,7 +31,7 @@
 
 <section class="stops" aria-label="Stops">
   {#if !c.routeId}
-    <p class="muted small hint">Choose a route for comparison {LETTERS[c.slot]} to list its stops.</p>
+    <p class="muted small hint">Once you pick a line, its stops show up here.</p>
   {:else if load?.status === "loading" || !load}
     <p class="muted small hint">Loading stops…</p>
   {:else if load.status === "error"}
@@ -38,11 +41,13 @@
       <h2>
         {#if route}<span class="route-badge" style:background="#{route.route_color || '888'}"
           style:color="#{route.route_text_color || 'fff'}">{route.route_short_name}</span>{/if}
-        {dir.stations.length} stops → {dir.headsign ?? ""}
+        <span class="toward"><span class="muted">toward</span> {dir.headsign ?? "—"}</span>
+        <span class="count muted">{dir.stations.length} stops</span>
       </h2>
-      <input type="search" placeholder="Filter stops…" bind:value={query} aria-label="Filter stops" />
+      <p class="prompt" style:--c={slotColor(c.slot)}><span class="bullet sm">{LETTERS[c.slot]}</span>{prompt}</p>
+      <input type="search" placeholder="Find a stop…" bind:value={query} aria-label="Filter stops" />
       {#if reach && reach.size < dir.stations.length - 1}
-        <p class="small muted">Greyed stops aren't served by any trip from {dir.stations[fromIdx]?.name}. Clicking one starts over from it.</p>
+        <p class="small muted">Faded stops aren't served by any trip from {dir.stations[fromIdx]?.name}. Tapping one starts over from it.</p>
       {/if}
     </div>
     <ol style:--c={slotColor(c.slot)}>
@@ -61,7 +66,7 @@
               {#if i === 0}<span class="note">trip origin: no realtime data</span>
               {:else if partial}<span class="note">{s.n_trips} of {dir.max_trips} trips</span>{/if}
             </span>
-            {#if r === "from"}<span class="tag">From</span>{:else if r === "to"}<span class="tag">To</span>{/if}
+            {#if r === "from"}<span class="tag">Get on</span>{:else if r === "to"}<span class="tag">Get off</span>{/if}
           </button>
         </li>
       {/each}
@@ -70,34 +75,42 @@
 </section>
 
 <style>
-  .stops { padding: 12px 0 24px; }
-  .hint { padding: 0 14px; }
-  .head { padding: 0 14px 8px; display: grid; gap: 8px; }
-  .head h2 { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-  .head input { width: 100%; }
+  .stops { padding: 16px 0 28px; }
+  .hint { padding: 0 18px; }
+  .head { padding: 0 16px 10px; display: grid; gap: 10px; }
+  .head h2 { display: flex; align-items: center; gap: 8px; font-size: 15px; min-width: 0; }
+  .toward { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .toward .muted { font-weight: 500; }
+  .count { margin-left: auto; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
+  .prompt { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; padding: 8px 10px;
+    border-radius: var(--radius-sm); background: color-mix(in srgb, var(--c) 9%, var(--surface)); }
+  .head input { width: 100%; padding-left: 34px;
+    background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%23888' stroke-width='1.7' stroke-linecap='round'%3E%3Ccircle cx='7' cy='7' r='4.5'/%3E%3Cpath d='m10.5 10.5 3 3'/%3E%3C/svg%3E") no-repeat 11px center; }
   ol { list-style: none; margin: 0; padding: 0; }
   li button {
-    width: 100%; display: flex; align-items: center; gap: 10px; border: 0; background: none;
-    text-align: left; padding: 0 14px 0 20px; min-height: 30px;
+    width: 100%; display: flex; align-items: center; gap: 12px; border: 0; background: none;
+    text-align: left; padding: 0 16px 0 22px; min-height: 34px; transition: background .1s;
   }
   li button:hover, li.hovered button { background: var(--surface-2); }
-  .track { position: relative; align-self: stretch; width: 12px; flex: none; }
-  .track::before { content: ""; position: absolute; left: 5px; top: 0; bottom: 0; width: 2px; background: var(--axis); }
+  /* strip map: a thick line with station dots, colored along the chosen stretch */
+  .track { position: relative; align-self: stretch; width: 18px; flex: none; }
+  .track::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: 6px; background: var(--surface-3); }
   .track.first::before { top: 50%; }
   .track.last::before { bottom: 50%; }
-  .node { position: absolute; left: 1px; top: 50%; width: 10px; height: 10px; margin-top: -5px; border-radius: 50%;
-    background: var(--surface); border: 2px solid var(--axis); }
-  li.between .track::before, li.from .track::before, li.to .track::before { background: var(--c); width: 4px; left: 4px; }
+  .node { position: absolute; left: 3px; top: 50%; width: 12px; height: 12px; margin-top: -6px; border-radius: 50%;
+    background: var(--surface); border: 2.5px solid var(--axis); transition: transform .12s; }
+  li button:hover .node { transform: scale(1.2); }
+  li.between .track::before, li.from .track::before, li.to .track::before { background: var(--c); }
   li.from .track::before { top: 50%; }
   li.to .track::before { bottom: 50%; }
-  li.from .node, li.to .node { background: var(--c); border-color: var(--surface); width: 14px; height: 14px;
-    left: -1px; margin-top: -7px; box-shadow: 0 0 0 1px var(--c); }
+  li.from .node, li.to .node { width: 20px; height: 20px; left: -1px; margin-top: -10px; background: var(--surface);
+    border: 4.5px solid var(--ink); }
   li.between .node { border-color: var(--c); }
-  li.unreachable .name { color: var(--muted); }
+  li.unreachable .name { color: var(--muted); opacity: .7; }
   li.unreachable .node { border-color: var(--grid); }
-  .name { flex: 1; min-width: 0; padding: 5px 0; font-size: 13px; }
-  li.from .name, li.to .name { font-weight: 600; }
-  .note { display: block; font-size: 11px; color: var(--muted); }
-  .tag { font-size: 11px; font-weight: 600; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px;
-    padding: 0 7px; }
+  .name { flex: 1; min-width: 0; padding: 6px 0; font-size: 14px; }
+  li.from .name, li.to .name { font-weight: 700; }
+  .note { display: block; font-size: 11.5px; color: var(--muted); }
+  .tag { font-size: 11.5px; font-weight: 700; color: #fff; background: var(--c); border-radius: 999px;
+    padding: 2px 9px; white-space: nowrap; }
 </style>

@@ -23,8 +23,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
 <div class="card" class:active onclick={() => (store.activeId = c.id)} style:--c={slotColor(c.slot)}>
   <div class="row">
-    <span class="key" style:background={slotColor(c.slot)}></span>
-    <strong class="letter">{LETTERS[c.slot]}</strong>
+    <span class="bullet lg">{LETTERS[c.slot]}</span>
     <select aria-label="Route for comparison {LETTERS[c.slot]}" value={c.routeId ?? ""}
       onchange={(e) => store.setRoute(c, (e.currentTarget as HTMLSelectElement).value || null)}>
       <option value="">Choose a route…</option>
@@ -34,13 +33,27 @@
         </optgroup>
       {/each}
     </select>
-    <button class="icon-btn" title="Zoom map to this segment" aria-label="Zoom map to comparison {LETTERS[c.slot]}"
-      onclick={(e) => { e.stopPropagation(); store.focus(c.id); }} disabled={!c.routeId}>⌖</button>
-    <button class="icon-btn" title="Duplicate (then change the route to compare the same stops)"
-      aria-label="Duplicate comparison {LETTERS[c.slot]}" onclick={(e) => { e.stopPropagation(); store.duplicate(c.id); }}
-      disabled={!c.routeId}>⧉</button>
-    <button class="icon-btn" title="Remove" aria-label="Remove comparison {LETTERS[c.slot]}"
-      onclick={(e) => { e.stopPropagation(); store.remove(c.id); }}>×</button>
+    <div class="tools">
+      <button class="icon-btn" title="Show on map" aria-label="Zoom map to comparison {LETTERS[c.slot]}"
+        onclick={(e) => { e.stopPropagation(); store.focus(c.id); }} disabled={!c.routeId}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <circle cx="8" cy="8" r="4.5" /><circle cx="8" cy="8" r="1.2" fill="currentColor" /><path d="M8 1v2M8 13v2M1 8h2M13 8h2" />
+        </svg>
+      </button>
+      <button class="icon-btn" title="Duplicate (then change the route to compare the same stops)"
+        aria-label="Duplicate comparison {LETTERS[c.slot]}" onclick={(e) => { e.stopPropagation(); store.duplicate(c.id); }}
+        disabled={!c.routeId}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
+          <rect x="5.5" y="5.5" width="8.5" height="8.5" rx="2" /><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H3.5A1.5 1.5 0 0 0 2 3v5.5A1.5 1.5 0 0 0 3.5 10H4" />
+        </svg>
+      </button>
+      <button class="icon-btn" title="Remove" aria-label="Remove comparison {LETTERS[c.slot]}"
+        onclick={(e) => { e.stopPropagation(); store.remove(c.id); }}>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+          <path d="M4 4l8 8M12 4l-8 8" />
+        </svg>
+      </button>
+    </div>
   </div>
 
   {#if detail && detail.directions.length > 1}
@@ -48,37 +61,47 @@
       {#each detail.directions as d}
         <button aria-pressed={c.directionId === d.direction_id}
           onclick={(e) => { e.stopPropagation(); store.setDirection(c, d.direction_id); }}>
-          → {d.headsign ?? `Direction ${d.direction_id}`}
+          {d.headsign ?? `Direction ${d.direction_id}`}
         </button>
       {/each}
     </div>
   {/if}
 
   {#if c.routeId}
-    <div class="pair small">
-      {#if c.from}
-        <span class="st">{stationName(c.from) ?? c.from}</span>
-        <span class="muted">→</span>
-        <span class="st">{c.to ? (stationName(c.to) ?? c.to) : "pick a downstream stop"}</span>
-      {:else}
-        <span class="muted">{active ? "Pick two stops in the list below or on the map" : "Select to pick stops"}</span>
-      {/if}
-    </div>
+    {#if c.from}
+      <ol class="trip" aria-label="Segment">
+        <li><span class="stop"></span><span class="st">{stationName(c.from) ?? c.from}</span></li>
+        <li class:pending={!c.to}><span class="stop"></span>
+          <span class="st">{c.to ? (stationName(c.to) ?? c.to) : "Now pick where you get off"}</span></li>
+      </ol>
+    {:else}
+      <p class="hint">{active ? "Pick where you get on, from the list below or the map" : "Tap to pick stops"}</p>
+    {/if}
     {#if seg?.status === "error"}<p class="small err">{seg.error}</p>{/if}
+  {:else}
+    <p class="hint">Start by choosing a bus or train line</p>
   {/if}
 </div>
 
 <style>
-  .card { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 8px 8px 10px;
-    background: var(--surface); display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; cursor: pointer; position: relative; }
-  .card.active { border-color: var(--c); box-shadow: inset 3px 0 0 var(--c); }
-  .row { display: flex; align-items: center; gap: 6px; }
-  .letter { font-size: 12px; width: 12px; }
-  select { flex: 1; min-width: 0; padding: 3px 6px; }
+  .card { padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; cursor: pointer;
+    box-shadow: none; border-width: 1.5px; transition: border-color .15s, box-shadow .15s; }
+  .card:hover { border-color: var(--border-strong); }
+  .card.active { border-color: var(--c); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 16%, transparent); }
+  .row { display: flex; align-items: center; gap: 10px; }
+  select { flex: 1; min-width: 0; font-weight: 600; }
+  .tools { display: flex; margin-right: -4px; }
   .dirs { display: flex; min-width: 0; }
-  .dirs button { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .pair { display: flex; gap: 6px; flex-wrap: wrap; color: var(--ink-2); }
-  .st { font-weight: 500; color: var(--ink); }
+  .dirs button { flex: 1; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .trip { list-style: none; margin: 0; padding: 0 0 0 9px; display: grid; gap: 4px; }
+  .trip li { display: flex; align-items: center; gap: 12px; position: relative; font-size: 13.5px; }
+  .trip li:first-child::after { content: ""; position: absolute; left: 4px; top: 13px; height: calc(100% + 1px);
+    width: 4px; background: var(--c); }
+  .stop { width: 12px; height: 12px; border-radius: 50%; background: var(--surface); border: 3px solid var(--c);
+    flex: none; position: relative; z-index: 1; }
+  .st { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pending .st { font-weight: 500; color: var(--muted); font-style: italic; }
+  .pending .stop { border-style: dashed; border-color: var(--axis); }
+  .hint { font-size: 13px; color: var(--muted); padding-left: 2px; }
   .err { color: var(--critical); }
-  .icon-btn:disabled { opacity: .35; cursor: default; }
 </style>

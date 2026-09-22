@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  export interface ReadoutRow { color?: string; value: string; name?: string; dashed?: boolean }
+  export interface ReadoutRow { color?: string; letter?: string; value: string; name?: string; dashed?: boolean }
   export interface Readout { x: number | Date; title: string; rows: ReadoutRow[] }
 </script>
 
@@ -78,7 +78,8 @@
       <div class="tt-title">{tip.r.title}</div>
       {#each tip.r.rows as row}
         <div class="tt-row">
-          {#if row.color}<span class="tt-key" class:dashed={row.dashed} style:--k={row.color}></span>{/if}
+          {#if row.letter && !row.dashed}<span class="bullet sm" style:--c={row.color}>{row.letter}</span>
+          {:else if row.color}<span class="tt-key" class:dashed={row.dashed} style:--k={row.color}></span>{/if}
           <strong>{row.value}</strong>
           {#if row.name}<span class="tt-name">{row.name}</span>{/if}
         </div>
@@ -89,15 +90,16 @@
 
 <style>
   .wrap { position: relative; }
-  .none { color: var(--muted); font-size: 13px; padding: 36px 0; text-align: center; }
-  .cross { position: absolute; width: 1px; background: var(--axis); pointer-events: none; }
+  .none { color: var(--muted); font-size: 13.5px; padding: 40px 16px; text-align: center; background: var(--surface-2);
+    border-radius: var(--radius-sm); }
+  .cross { position: absolute; width: 1.5px; background: var(--axis); pointer-events: none; }
   .tip { position: absolute; z-index: 5; pointer-events: none; background: var(--surface); color: var(--ink);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px; min-width: 150px;
-    box-shadow: 0 6px 20px rgba(0,0,0,.14); }
-  .tt-title { color: var(--ink-2); margin-bottom: 3px; }
+    border: 1px solid var(--border); border-radius: 12px; padding: 9px 12px; font-size: 12.5px; min-width: 160px;
+    box-shadow: var(--shadow-pop); display: grid; gap: 4px; }
+  .tt-title { color: var(--muted); font-weight: 600; font-size: 12px; }
   .tt-row { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
   .tt-row strong { font-variant-numeric: tabular-nums; }
-  .tt-key { width: 12px; height: 2px; border-radius: 1px; background: var(--k); flex: none; }
-  .tt-key.dashed { background: repeating-linear-gradient(90deg, var(--k) 0 4px, transparent 4px 6px); }
+  .tt-key { width: 18px; height: 3px; border-radius: 2px; background: var(--k); flex: none; }
+  .tt-key.dashed { background: repeating-linear-gradient(90deg, var(--k) 0 4px, transparent 4px 7px); }
   .tt-name { color: var(--ink-2); }
 </style>

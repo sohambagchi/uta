@@ -8,6 +8,7 @@
   import { api, type NetworkLine, type Vehicle, type LngLat } from "./api";
   import { store } from "./store.svelte";
   import { fmtSignedMin } from "./format";
+  import { theme } from "./theme.svelte";
 
   maplibregl.setWorkerUrl(workerUrl);
 
@@ -21,18 +22,17 @@
 
   // Delay status: reserved status colors, always paired with a label in the legend/popup.
   const STATUS = [
-    { key: "early", label: "Early > 1 min", color: "#fab219", test: (d: number) => d < -60 },
-    { key: "ok", label: "On time", color: "#0ca30c", test: (d: number) => d <= 300 },
-    { key: "late", label: "Late 5–10 min", color: "#ec835a", test: (d: number) => d <= 600 },
-    { key: "vlate", label: "Late > 10 min", color: "#d03b3b", test: () => true },
+    { key: "early", label: "Early by 1+ min", color: "#fccc0a", test: (d: number) => d < -60 },
+    { key: "ok", label: "On time", color: "#6cbe45", test: (d: number) => d <= 300 },
+    { key: "late", label: "5–10 min late", color: "#ff8a1f", test: (d: number) => d <= 600 },
+    { key: "vlate", label: "10+ min late", color: "#ee352e", test: () => true },
   ];
-  const NO_DATA = { key: "none", label: "No prediction", color: "#898781" };
+  const NO_DATA = { key: "none", label: "No estimate", color: "#a7a9ac" };
   const statusOf = (d: number | null) => (d == null ? NO_DATA : STATUS.find((s) => s.test(d))!);
 
   let container: HTMLDivElement;
   let map: MLMap | undefined;
   let styleReady = $state(false);
-  let dark = $state(matchMedia("(prefers-color-scheme: dark)").matches);
   let vehicleScope = $state<"compared" | "all">("all");
   let showNetwork = $state(true);
   let network: NetworkLine[] = [];
@@ -63,9 +63,14 @@
       if (!map.getSource(id)) map.addSource(id, { type: "geojson", data: empty });
     }
     const ink2 = css("--ink-2"), surface = css("--surface");
+    // bus lines as a quiet grey mesh; rail lines in UTA's own colors, like a transit map
     map.addLayer({ id: "network", type: "line", source: "network",
-      layout: { "line-join": "round", "line-cap": "round" },
-      paint: { "line-color": css("--muted"), "line-width": ["interpolate", ["linear"], ["zoom"], 9, 0.6, 14, 1.6], "line-opacity": 0.45 } });
+      layout: { "line-join": "round", "line-cap": "round", "line-sort-key": ["case", ["get", "rail"], 1, 0] },
+      paint: {
+        "line-color": ["case", ["get", "rail"], ["get", "color"], css("--muted")],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, ["case", ["get", "rail"], 2, 0.6], 14, ["case", ["get", "rail"], 4, 1.6]],
+        "line-opacity": ["case", ["get", "rail"], 0.55, 0.35],
+      } });
     map.addLayer({ id: "route", type: "line", source: "route",
       layout: { "line-join": "round", "line-cap": "round" },
       paint: { "line-color": ink2, "line-width": ["interpolate", ["linear"], ["zoom"], 9, 1.5, 15, 4], "line-opacity": 0.55 } });
@@ -132,7 +137,11 @@
   const fc = (features: Feature[]): FeatureCollection => ({ type: "FeatureCollection", features });
 
   function pushNetwork() {
-    source("network")?.setData(fc(showNetwork ? network.map((n) => line(n.coords)) : []));
+    source("network")?.setData(fc(showNetwork ? network.map((n) => {
+      const type = store.routeById.get(n.route_id)?.route_type;
+      const rail = type != null && type !== 3 && !!n.color;
+      return line(n.coords, { rail, color: rail ? `#${n.color}` : "" });
+    }) : []));
   }
   function pushRoute() {
     const shape = store.direction(store.active)?.shape;
@@ -224,25 +233,29 @@
   }
 
   function vehicleCard(v: Vehicle): HTMLElement {
-    const el = document.createElement("div");
     const s = statusOf(v.delay_s);
     const age = Math.max(0, Math.round(Date.now() / 1000 - v.ts));
-    const rows: [string, string][] = [
-      [`Route ${v.route_short_name ?? "?"}`, v.trip_headsign ? `→ ${v.trip_headsign}` : ""],
-      [v.delay_s == null ? "No prediction" : `${fmtSignedMin(v.delay_s)} min`, v.delay_s == null ? "" : s.label.toLowerCase()],
-      ["Next stop", v.next_stop_name ?? "–"],
-      [`Vehicle ${v.vehicle_id}`, `${v.speed != null ? Math.round(v.speed * 2.237) + " mph · " : ""}${age}s ago`],
-    ];
-    for (const [a, b] of rows) {
-      const r = document.createElement("div");
-      const strong = document.createElement("strong");
-      strong.textContent = a;
-      const span = document.createElement("span");
-      span.style.color = "var(--ink-2)";
-      span.textContent = b ? " " + b : "";
-      r.append(strong, span);
-      el.append(r);
-    }
+    const route = store.routeById.get(v.route_id ?? "");
+    const el = document.createElement("div");
+    el.className = "vcard";
+    const add = (parent: HTMLElement, tag: string, cls: string, text = "") => {
+      const e = document.createElement(tag);
+      e.className = cls;
+      e.textContent = text;
+      parent.append(e);
+      return e;
+    };
+    const head = add(el, "div", "vc-head");
+    const badge = add(head, "span", "route-badge", v.route_short_name ?? "?");
+    badge.style.background = `#${route?.route_color || "888"}`;
+    badge.style.color = `#${route?.route_text_color || "fff"}`;
+    add(head, "strong", "", v.trip_headsign ? `to ${v.trip_headsign}` : "");
+    const st = add(el, "div", "vc-status");
+    add(st, "span", "vc-dot").style.background = s.color;
+    add(st, "strong", "", v.delay_s == null ? "No estimate" : Math.abs(v.delay_s) <= 60 ? "Right on time"
+      : `${fmtSignedMin(v.delay_s).replace("+", "")} min ${v.delay_s > 0 ? "late" : "early"}`);
+    add(el, "div", "vc-row", `Next stop: ${v.next_stop_name ?? "–"}`);
+    add(el, "div", "vc-meta", `Vehicle ${v.vehicle_id} · ${v.speed != null ? Math.round(v.speed * 2.237) + " mph · " : ""}seen ${age}s ago`);
     return el;
   }
 
@@ -284,7 +297,17 @@
     store.active?.from; store.active?.to; store.active?.slot; store.hoverStation; store.details; pushStations();
   });
   $effect(() => { vehicleScope; comparedRoutes; pushVehicles(1); });
-  $effect(() => { showNetwork; pushNetwork(); });
+  $effect(() => { showNetwork; store.routeById; pushNetwork(); });
+
+  // basemap follows the app theme; installLayers re-reads the CSS tokens on style.load
+  let shownTheme = theme.current;
+  $effect(() => {
+    const t = theme.current;
+    if (!map || t === shownTheme) return;
+    shownTheme = t;
+    styleReady = false;
+    map.setStyle(STYLES[t]);
+  });
 
   const counts = $derived.by(() => {
     const m: Record<string, number> = {};
@@ -296,12 +319,13 @@
     return m;
   });
 
+  const others = $derived(vehicles.length - Object.values(counts).reduce((a, b) => a + b, 0));
+
   // ------------------------------------------------------------ lifecycle
 
   onMount(() => {
-    const mq = matchMedia("(prefers-color-scheme: dark)");
     const m = new maplibregl.Map({
-      container, style: dark ? STYLES.dark : STYLES.light, center: [-111.89, 40.68], zoom: 10,
+      container, style: STYLES[shownTheme], center: [-111.89, 40.68], zoom: 10,
       attributionControl: { compact: true },
     });
     map = m;
@@ -338,12 +362,6 @@
     });
     m.on("mouseleave", "stations", () => (store.hoverStation = null));
 
-    const onScheme = (e: MediaQueryListEvent) => {
-      dark = e.matches;
-      styleReady = false;
-      map?.setStyle(dark ? STYLES.dark : STYLES.light);
-    };
-    mq.addEventListener("change", onScheme);
     const ro = new ResizeObserver(() => map?.resize());
     ro.observe(container);
 
@@ -353,7 +371,6 @@
     return () => {
       clearInterval(timer);
       cancelAnimationFrame(raf);
-      mq.removeEventListener("change", onScheme);
       ro.disconnect();
       map?.remove();
     };
@@ -365,37 +382,50 @@
 <div class="controls">
   <div class="seg" role="group" aria-label="Vehicles shown">
     <button aria-pressed={vehicleScope === "all"} onclick={() => (vehicleScope = "all")}>All vehicles</button>
-    <button aria-pressed={vehicleScope === "compared"} onclick={() => (vehicleScope = "compared")}>Compared routes</button>
+    <button aria-pressed={vehicleScope === "compared"} onclick={() => (vehicleScope = "compared")}>Just my lines</button>
   </div>
-  <label class="small"><input type="checkbox" bind:checked={showNetwork} /> All route lines</label>
+  <label class="small"><input type="checkbox" bind:checked={showNetwork} /> Route map</label>
 </div>
 
 <div class="legend small" aria-label="Vehicle delay legend">
-  <div class="title">Vehicles on compared routes</div>
-  {#each [...STATUS, NO_DATA] as s}
-    <div><span class="dotk" style:background={s.color}></span>{s.label} <span class="muted">{counts[s.key] ?? 0}</span></div>
-  {/each}
-  <div><span class="dotk other"></span>Other routes</div>
-  <div class="muted asof">
+  <div class="title">
+    <span class="live" class:off={liveError || !asOf}></span>
     {#if liveError}Live feed unavailable
-    {:else if asOf}{vehicles.length} active · as of {new Date(asOf * 1000).toLocaleTimeString()}
-    {:else}No active vehicles. Is the collector running?{/if}
+    {:else if asOf}Live · {new Date(asOf * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+    {:else}Waiting for vehicles{/if}
   </div>
+  <div class="sub muted">Vehicles on your lines</div>
+  {#each [...STATUS, NO_DATA] as s}
+    <div class="row"><span class="dotk" style:background={s.color}></span><span>{s.label}</span><span class="n">{counts[s.key] ?? 0}</span></div>
+  {/each}
+  <div class="row"><span class="dotk other"></span><span>Other lines</span><span class="n">{asOf ? others : ""}</span></div>
+  {#if !liveError && !asOf}<div class="muted hint">Is the collector running?</div>{/if}
 </div>
 
 <style>
   .map { position: absolute; inset: 0; }
-  .controls { position: absolute; top: 10px; right: 10px; display: flex; gap: 10px; align-items: center;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 6px 8px;
-    box-shadow: 0 2px 10px rgba(0,0,0,.08); flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 80px); }
-  .controls label { display: flex; gap: 4px; align-items: center; color: var(--ink-2); white-space: nowrap; }
-  .legend { position: absolute; left: 10px; bottom: 26px; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 8px 10px; display: grid; gap: 2px; color: var(--ink-2);
-    box-shadow: 0 2px 10px rgba(0,0,0,.08); }
-  .legend .title { font-weight: 600; color: var(--ink); margin-bottom: 2px; }
-  .dotk { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px;
-    box-shadow: 0 0 0 2px var(--surface); }
-  .dotk.other { width: 7px; height: 7px; margin: 0 7.5px 0 1.5px; background: var(--muted); opacity: .75; }
-  .asof { margin-top: 4px; font-size: 11px; }
-  @media (max-width: 600px) { .legend { display: none; } }
+  .controls { position: absolute; top: 12px; right: 12px; display: flex; gap: 12px; align-items: center;
+    background: var(--surface); border-radius: 999px; padding: 4px 14px 4px 4px;
+    box-shadow: var(--shadow-pop); flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 80px); }
+  .controls label { display: flex; gap: 6px; align-items: center; color: var(--ink-2); white-space: nowrap; font-weight: 500;
+    cursor: pointer; }
+  .legend { position: absolute; left: 12px; bottom: 28px; background: var(--surface); border-radius: 14px;
+    padding: 12px 14px; display: grid; gap: 3px; color: var(--ink-2); min-width: 190px; box-shadow: var(--shadow-pop); }
+  .legend .title { font-weight: 700; color: var(--ink); font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
+  .legend .sub { font-size: 11.5px; margin-bottom: 4px; }
+  .legend .row { display: flex; align-items: center; }
+  .legend .n { margin-left: auto; padding-left: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .legend .hint { font-size: 11.5px; margin-top: 4px; }
+  .live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+  .live.off { background: var(--no-data); }
+  .dotk { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 8px; flex: none;
+    box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--border); }
+  .dotk.other { width: 7px; height: 7px; margin: 0 10px 0 2px; background: var(--muted); opacity: .75; box-shadow: none; }
+  :global(.vcard) { display: grid; gap: 5px; min-width: 190px; padding-right: 14px; }
+  :global(.vc-head) { display: flex; align-items: center; gap: 8px; }
+  :global(.vc-status) { display: flex; align-items: center; gap: 7px; }
+  :global(.vc-dot) { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  :global(.vc-row) { color: var(--ink-2); }
+  :global(.vc-meta) { color: var(--muted); font-size: 12px; }
+  @media (max-width: 600px) { .legend, .controls label { display: none; } .controls { padding-right: 4px; } }
 </style>

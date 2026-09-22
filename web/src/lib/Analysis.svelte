@@ -25,29 +25,37 @@
   <Filters />
 
   {#if !series.length}
-    <div class="empty">
+    <div class="card empty">
       {#if loading}
         <p class="muted">Loading trips…</p>
       {:else}
-        <p><strong>Pick a route and two stops</strong> in the left column (or click stops on the map). You'll get
-          observed and scheduled travel times between them, how they vary by time of day and day of week, and
-          how spread out they are.</p>
-        <p class="muted">Add up to four comparisons: different routes over the same stops, or different stretches of one
-          route. Observed times come from the realtime feed and cover the period the collector has been running.</p>
+        <h2>Let's time a ride</h2>
+        <ol class="steps">
+          <li><span class="bullet lg" style:--c="var(--series-1)">1</span>
+            <div><strong>Choose a line</strong><p>Any bus, TRAX, streetcar or FrontRunner route, on the left.</p></div></li>
+          <li><span class="bullet lg" style:--c="var(--series-2)">2</span>
+            <div><strong>Tap two stops</strong><p>Where you'd get on and where you'd get off. Stops on the map work too.</p></div></li>
+          <li><span class="bullet lg" style:--c="var(--series-3)">3</span>
+            <div><strong>See how long it really takes</strong><p>Measured trip times next to the timetable, by hour and by day.</p></div></li>
+        </ol>
+        <p class="muted small">Add up to four rides to compare different lines over the same stops, or different stretches of
+          one line. Measured times come from UTA's live feed and cover the time the collector has been running.</p>
       {/if}
     </div>
   {:else}
     <div class="legend" class:loading aria-label="Comparisons">
       {#each series as s (s.c.id)}
-        <button class="item" class:active={s.c.id === store.activeId} onclick={() => (store.activeId = s.c.id)}>
-          <span class="key" style:background={s.color}></span>
-          <strong>{s.letter}</strong> {s.label}
+        <button class="item" class:active={s.c.id === store.activeId} onclick={() => (store.activeId = s.c.id)}
+          style:--c={s.color} aria-pressed={s.c.id === store.activeId}>
+          <span class="bullet">{s.letter}</span>
+          <span class="route">{s.routeShort}</span>
+          <span class="label">{s.seg.from.name} → {s.seg.to.name}</span>
         </button>
       {/each}
-      {#if pending}<span class="muted small">{pending} comparison{pending > 1 ? "s" : ""} still need stops</span>{/if}
+      {#if pending}<span class="muted small">{pending} more ride{pending > 1 ? "s" : ""} still need{pending > 1 ? "" : "s"} stops</span>{/if}
     </div>
 
-    <div class:loading>
+    <div class="stack" class:loading>
       <SummaryTable {series} />
       <Charts {series} active={activeSeries} bin={store.filters.bin} />
       {#if activeSeries}<TripsTable s={activeSeries} />{/if}
@@ -56,13 +64,22 @@
 </div>
 
 <style>
-  .analysis { padding: 16px 20px 48px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; max-width: 1600px; }
-  .empty { background: var(--surface); border: 1px dashed var(--axis); border-radius: var(--radius); padding: 24px;
-    max-width: 720px; display: grid; gap: 10px; }
-  .legend { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-  .item { display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; background: none;
-    border-radius: 8px; padding: 3px 8px; font-size: 13px; color: var(--ink-2); }
-  .item strong { color: var(--ink); }
-  .item.active { border-color: var(--border); background: var(--surface); color: var(--ink); }
+  .analysis { padding: 20px 24px 56px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; max-width: 1600px; }
+  .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .empty { max-width: 760px; display: grid; gap: 18px; padding: 24px 26px; }
+  .empty h2 { font-size: 20px; }
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+  .steps li { display: flex; gap: 14px; align-items: flex-start; }
+  .steps strong { font-size: 15px; }
+  .steps p { color: var(--ink-2); font-size: 13.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .item { display: inline-flex; align-items: center; gap: 8px; border: 1.5px solid var(--border); background: var(--surface);
+    border-radius: 999px; padding: 4px 14px 4px 4px; font-size: 13.5px; color: var(--ink-2); max-width: 100%;
+    transition: border-color .15s, box-shadow .15s; }
+  .item:hover { border-color: var(--border-strong); }
+  .item.active { border-color: var(--c); color: var(--ink); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 16%, transparent); }
+  .item .route { font-weight: 700; color: var(--ink); }
+  .item .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .loading { opacity: .5; transition: opacity .15s; }
+  @media (max-width: 900px) { .analysis { padding: 16px 16px 48px; } }
 </style>

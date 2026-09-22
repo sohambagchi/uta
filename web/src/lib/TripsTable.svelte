@@ -11,15 +11,15 @@
 
 <figure class="card">
   <figcaption>
-    <h2><span class="key" style:background={s.color}></span> {s.letter}: trips</h2>
-    <p>{s.label}. Latest {Math.min(LIMIT, s.trips.length)} of {s.trips.length.toLocaleString()} observed trips matching the filters.</p>
+    <h2><span class="bullet" style:--c={s.color}>{s.letter}</span> Recent rides</h2>
+    <p>{s.label}. Latest {Math.min(LIMIT, s.trips.length)} of {s.trips.length.toLocaleString()} measured rides matching the filters.</p>
   </figcaption>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>Date</th><th>Departed</th><th>Vehicle</th>
-          <th class="num">Minutes</th><th class="num">Scheduled</th><th class="num">vs sched.</th>
+          <th>Date</th><th>Left at</th><th>Vehicle</th>
+          <th class="num">Minutes</th><th class="num">Timetable</th><th class="num">vs timetable</th>
           <th class="num" title="How late the vehicle left the first stop">Left late by</th>
         </tr>
       </thead>
@@ -32,11 +32,11 @@
             <td>{t.vehicleId ?? "–"}</td>
             <td class="num">{fmtMin(t.dur)}</td>
             <td class="num">{fmtMin(t.sched)}</td>
-            <td class="num" class:up={diff != null && diff > 30} class:down={diff != null && diff < -30}>{fmtSignedMin(diff)}</td>
+            <td class="num"><span class="delta" class:up={diff != null && diff > 30} class:down={diff != null && diff < -30}>{fmtSignedMin(diff)}</span></td>
             <td class="num">{fmtSignedMin(t.depDelay)}</td>
           </tr>
         {:else}
-          <tr><td colspan="7" class="muted">No observed trips match the filters yet.</td></tr>
+          <tr><td colspan="7" class="muted">No measured rides match the filters yet.</td></tr>
         {/each}
       </tbody>
     </table>
@@ -44,15 +44,13 @@
 </figure>
 
 <style>
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin: 0; }
-  figcaption { margin-bottom: 10px; }
   figcaption h2 { display: flex; align-items: center; gap: 8px; }
-  figcaption p { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .table-wrap { overflow: auto; max-height: 420px; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; text-align: left; }
-  th { color: var(--ink-2); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--surface); }
+  .table-wrap { overflow: auto; max-height: 440px; margin: 0 -8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { padding: 7px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--surface); }
   tbody tr:hover td { background: var(--surface-2); }
-  .up { color: var(--delta-up); }
-  .down { color: var(--delta-down); }
+  .delta { display: inline-block; padding: 0 7px; border-radius: 999px; font-weight: 600; }
+  .up { color: var(--delta-up); background: color-mix(in srgb, var(--delta-up) 11%, transparent); }
+  .down { color: var(--delta-down); background: color-mix(in srgb, var(--delta-down) 11%, transparent); }
 </style>
