@@ -17,6 +17,7 @@
 - [2026-09-21-2200-background-collector](adr/2026-09-21-2200-background-collector.md) — collector as a pinned service; only it migrates
 - [2026-09-21-2300-compact-history](adr/2026-09-21-2300-compact-history.md) — schema v3: compact visits written once, trip vehicles, GPS blocks, tmpfs live state
 - [2026-09-22-0025-analytics-dashboard](adr/2026-09-22-0025-analytics-dashboard.md) — pages per level, per-day facts in memory, minimal text
+- [2026-09-22-1159-multi-node-hosting](adr/2026-09-22-1159-multi-node-hosting.md) — two local collectors → R2 inbox → merged copy on GCP, Pages frontend via Cloudflare Tunnel
 
 ## Changes
 
