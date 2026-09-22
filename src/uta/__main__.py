@@ -23,7 +23,7 @@ def main(argv=None):
         s.add_argument("--interval", type=float, default=30.0, help="poll interval seconds")
         s.add_argument("--no-positions", action="store_true", help="don't store vehicle GPS history")
         if name == "up":
-            s.add_argument("--host", default="127.0.0.1")
+            s.add_argument("--host", default="0.0.0.0", help="bind address (default: all interfaces)")
             s.add_argument("--port", type=int, default=8000)
 
     s = sub.add_parser("serve", help="dashboard + API only")

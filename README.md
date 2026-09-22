@@ -15,8 +15,11 @@ that stretch actually takes:
 Needs Nix with flakes (Determinate Nix has them on by default).
 
 ```sh
-nix run . -- up            # import GTFS, start collector + dashboard on http://127.0.0.1:8000
+nix run . -- up            # import GTFS, start collector + dashboard on port 8000, all interfaces
 ```
+
+`up` listens on `0.0.0.0` so other devices on your network can open the dashboard; pass
+`--host 127.0.0.1` to keep it local. `serve` binds to `127.0.0.1` by default.
 
 **History only exists from when the collector starts.** UTA doesn't publish archived realtime
 data, so run `collect` (or `up`) continuously. Timetable figures work immediately. Observed ones
